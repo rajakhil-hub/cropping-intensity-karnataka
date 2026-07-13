@@ -89,7 +89,12 @@ def count_cycles(values: np.ndarray, dates_or_step_days, cfg: dict) -> dict:
         width_days = widths_steps * step_days
         peaks = peaks[width_days >= peaks_cfg["min_cycle_days"]]
 
-    plateau_threshold = np.nanmin(smoothed) + 0.4 * amplitude
+    # Plateau must be both relatively high within the series AND absolutely green:
+    # a flat low-NDVI (bare/built-up) pixel trivially clears the relative bar alone.
+    plateau_threshold = max(
+        np.nanmin(smoothed) + 0.4 * amplitude,
+        peaks_cfg["plateau_min_ndvi"],
+    )
     longest_run_steps = _longest_run(smoothed >= plateau_threshold)
 
     n_peaks = int(peaks.size)

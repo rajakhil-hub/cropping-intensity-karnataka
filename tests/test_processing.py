@@ -75,8 +75,10 @@ def test_all_nan_is_nodata() -> None:
 
 def test_year_long_plateau_flags_class_four() -> None:
     """A long contiguous high-NDVI stretch (sugarcane/plantation signature) overrides the peak count and flags class 4."""
+    # Realistic sugarcane: sustained high NDVI (~0.75) for most of the year. Must clear
+    # both the relative bar and the absolute plateau_min_ndvi floor after smoothing.
     curve = np.full(N, 0.2)
-    curve[3:22] = 0.6  # 19 steps * 15 days/step = 285 days > plateau_flag_days (270)
+    curve[2:23] = 0.75  # 21 steps * 15 days/step = 315 days > plateau_flag_days (270)
     result = count_cycles(curve, STEP_DAYS, cfg)
     assert "long_plateau" in result["flags"]
     assert result["class_id"] == 4

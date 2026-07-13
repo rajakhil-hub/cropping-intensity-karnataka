@@ -23,7 +23,9 @@ def s2_ndvi_collection(aoi: ee.Geometry, cfg: dict) -> ee.ImageCollection:
     def _to_masked_ndvi(img: ee.Image) -> ee.Image:
         mask = img.select(cs_band).gte(threshold)
         ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-        return ndvi.updateMask(mask)
+        # normalizedDifference/rename build a fresh Image and drop system:time_start —
+        # copy it back on, since composite_series's per-period filterDate() depends on it.
+        return ee.Image(ndvi.updateMask(mask).copyProperties(img, ["system:time_start"]))
 
     return linked.map(_to_masked_ndvi)
 
@@ -44,7 +46,9 @@ def s1_vh_collection(aoi: ee.Geometry, cfg: dict) -> ee.ImageCollection:
     )
 
     def _despeckle(img: ee.Image) -> ee.Image:
-        return img.focalMedian(30, "circle", "meters").rename(band)
+        # focalMedian/rename drop system:time_start like the NDVI path above — copy it
+        # back on so composite_series's per-period filterDate() sees these images.
+        return ee.Image(img.focalMedian(30, "circle", "meters").rename(band).copyProperties(img, ["system:time_start"]))
 
     return s1.map(_despeckle)
 

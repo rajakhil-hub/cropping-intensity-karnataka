@@ -43,13 +43,26 @@ def load_aoi_geometry(cfg: dict) -> ee.Geometry:
     return ee.Geometry(json.loads(geojson_path.read_text()))
 
 
+def points_buffer_geometry(points: list[dict], buffer_m: int = 500) -> ee.Geometry:
+    """Union of ~buffer_m-radius circles around each sample point.
+
+    Point extraction only ever needs pixels under these tiny neighborhoods, not the
+    full district — scoping filterBounds/compositing to this geometry (instead of the
+    whole Raichur boundary) is what keeps the server-side compute within memory limits.
+    """
+    return ee.Geometry.MultiPoint([[p["lon"], p["lat"]] for p in points]).buffer(buffer_m)
+
+
 def main() -> None:
     """Sample NDVI and VH composite stacks at configured points and write a tidy long-format CSV."""
     points = load_sample_points()
     cfg = load_config()
     ee_init()
 
-    aoi = load_aoi_geometry(cfg)
+    # Point extraction only touches ~20 small neighborhoods, not the whole district —
+    # scope filterBounds/clip to a buffered union of the points instead of the full
+    # Raichur boundary (see points_buffer_geometry docstring for why).
+    aoi = points_buffer_geometry(points)
     points_fc = ee.FeatureCollection(
         [
             ee.Feature(ee.Geometry.Point([p["lon"], p["lat"]]), {"name": p["name"], "group": p.get("group", "")})

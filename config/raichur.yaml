@@ -31,6 +31,7 @@ peaks:                          # provisional — tune after sample-point inspec
   min_distance_days: 75         # minimum separation between two cycle peaks
   crop_amplitude_floor: 0.15    # below this seasonal amplitude => fallow/non-crop
   plateau_flag_days: 270        # green longer than this with no trough => sugarcane/plantation flag
+  plateau_min_ndvi: 0.50        # ...AND sustained above this absolute NDVI (real greenness, not flat bare soil)
 
 classes:
   0: fallow_or_noncrop
