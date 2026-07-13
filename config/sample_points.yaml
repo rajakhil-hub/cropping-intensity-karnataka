@@ -1,0 +1,29 @@
+# ~20 NDVI-inspection sample points for Raichur (agri-year 2024-25).
+# Sourced by geo-researcher from town/village geocodes + ICRISAT/ACIWRM TLBC command-area
+# map (Gumma et al. 2019) + taluk-level irrigation profiles. Points marked medium/low
+# confidence are analyst-interpolated, NOT parcel-verified — the inspection notebook is
+# exactly where they get validated or discarded.
+points:
+  # ---- COMMAND AREA (TLBC, irrigated paddy — expect 2-3 cycles) ----
+  - {name: Sindhanur_town,          lon: 76.7560, lat: 15.7702, group: command, confidence: high,       note: "Sindhanur taluk HQ; ~65% canal-irrigated, paddy twice/year"}
+  - {name: Sindhanur_NE_paddy,      lon: 76.8200, lat: 15.8100, group: command, confidence: medium,     note: "~9km NE of Sindhanur, within TLBC command belt (ICRISAT map)"}
+  - {name: Sindhanur_W_paddy,       lon: 76.6800, lat: 15.7500, group: command, confidence: medium,     note: "SW of Sindhanur, inside command polygon per ICRISAT map extent"}
+  - {name: Sindhanur_S_paddy,       lon: 76.7300, lat: 15.6900, group: command, confidence: medium,     note: "South of Sindhanur town, taluk paddy belt"}
+  - {name: Manvi_town,              lon: 77.0503, lat: 15.9913, group: command, confidence: high,       note: "Manvi taluk HQ, within TLBC command; paddy + some cotton"}
+  - {name: Manvi_N_paddy,           lon: 77.0200, lat: 16.0400, group: command, confidence: medium,     note: "N of Manvi toward canal branch, within mapped command extent"}
+  - {name: Manvi_E_paddy,           lon: 77.1200, lat: 15.9700, group: command, confidence: medium-low, note: "E of Manvi, near edge of mapped TLBC extent — verify"}
+  - {name: Sirwar_village,          lon: 77.0282, lat: 16.1189, group: command, confidence: medium,     note: "Sirwar, Manvi taluk; geocode sources conflict — approximate"}
+  - {name: Sindhanur_Manvi_midbelt, lon: 76.9300, lat: 15.9000, group: command, confidence: medium-high, note: "Midpoint Sindhanur-Manvi; core of TLBC command crescent"}
+  - {name: Raichur_canal_tail,      lon: 77.2000, lat: 16.1500, group: command, confidence: low-medium, note: "Raichur taluk, TLBC tail end — may be command-fringe"}
+  # ---- RAINFED UPLAND (non-command dryland — expect 1 cycle) ----
+  - {name: Devadurga_town,          lon: 76.9355, lat: 16.4235, group: rainfed, confidence: high,       note: "Devadurga taluk HQ; taluk outside TLBC, rainfed jowar/cotton/pulses"}
+  - {name: Devadurga_S_dryland,     lon: 76.9700, lat: 16.3600, group: rainfed, confidence: medium,     note: "S of Devadurga town, rainfed cropland"}
+  - {name: Devadurga_W_dryland,     lon: 76.8600, lat: 16.3900, group: rainfed, confidence: medium,     note: "W of Devadurga town, rainfed"}
+  - {name: Lingsugur_town,          lon: 76.5217, lat: 16.1588, group: rainfed, confidence: high,       note: "Lingasugur taluk HQ; outside TLBC, rainfed cotton/jowar/sunflower"}
+  - {name: Lingsugur_E_dryland,     lon: 76.6200, lat: 16.1300, group: rainfed, confidence: medium,     note: "E of Lingsugur town, rainfed cropland"}
+  - {name: Lingsugur_N_dryland,     lon: 76.5500, lat: 16.2400, group: rainfed, confidence: medium,     note: "N of Lingsugur town, rainfed cropland"}
+  - {name: Maski_village,           lon: 76.6556, lat: 15.9572, group: rainfed, confidence: medium,     note: "Maski, Lingsugur taluk; rainfed cotton/millet region"}
+  - {name: Gurgunta_dryland,        lon: 76.7500, lat: 16.2800, group: rainfed, confidence: low-medium, note: "Between Devadurga and Jaladurga; scrub/single rainfed crop"}
+  # ---- FALLOW / SCRUB (expect 0 cycles) ----
+  - {name: Jaladurga_scrub,         lon: 76.4197, lat: 16.2525, group: fallow,  confidence: medium,     note: "Jaladurga fort area, Krishna gorge; scrub/grassland — near district edge, verify inside boundary"}
+  - {name: Mudgal_scrub_fallow,     lon: 76.4300, lat: 16.0119, group: fallow,  confidence: low-medium, note: "Mudgal, Lingsugur taluk; rocky tract, likely scrub/fallow"}

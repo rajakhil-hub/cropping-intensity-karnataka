@@ -1,0 +1,17 @@
+# Phase 1 (classical baseline) only — DL deps (torch/terratorch/clay/sam2) arrive in Phase 3.
+earthengine-api
+geemap
+geopandas
+rasterio
+rioxarray
+xarray
+shapely
+scipy
+numpy
+pandas
+matplotlib
+pyyaml
+jupyter
+tqdm
+requests
+pytest

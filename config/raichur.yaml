@@ -1,0 +1,41 @@
+# Raichur Tier-1 pilot — all pipeline parameters live here, not in code.
+aoi:
+  name: raichur
+  gaul_adm1: Karnataka
+  gaul_adm2: Raichur          # FAO GAUL level-2 (GEE: FAO/GAUL/2015/level2)
+  geojson: config/raichur_boundary.geojson   # written by scripts/fetch_boundary.py
+
+agri_year:
+  start: "2024-06-01"
+  end: "2025-05-31"
+
+satellite:
+  s2_collection: COPERNICUS/S2_SR_HARMONIZED
+  cloudscore_collection: GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED
+  cloudscore_band: cs_cdf
+  cloudscore_threshold: 0.60   # keep pixels with cs_cdf >= threshold
+  s1_collection: COPERNICUS/S1_GRD
+  s1_band: VH
+  composite_days: 15
+  scale_m: 10
+
+timeseries:
+  gapfill: linear
+  savgol_window: 7             # in composite steps (7 x 15d ~ 105 days)
+  savgol_polyorder: 2
+
+peaks:                          # provisional — tune after sample-point inspection
+  min_prominence: 0.20          # NDVI units
+  min_peak_ndvi: 0.35           # absolute NDVI floor for a real crop peak
+  min_cycle_days: 60            # reject spurious short bumps
+  min_distance_days: 75         # minimum separation between two cycle peaks
+  crop_amplitude_floor: 0.15    # below this seasonal amplitude => fallow/non-crop
+  plateau_flag_days: 270        # green longer than this with no trough => sugarcane/plantation flag
+
+classes:
+  0: fallow_or_noncrop
+  1: single
+  2: double
+  3: triple_plus
+  4: long_plateau_flag          # sugarcane / plantation suspicion, reviewed in QA
+  255: nodata
