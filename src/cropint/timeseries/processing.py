@@ -31,6 +31,64 @@ def smooth_savgol(values: np.ndarray, cfg: dict) -> np.ndarray:
     return savgol_filter(values, window_length=window, polyorder=polyorder)
 
 
+def gapfill_linear_batch(arr: np.ndarray) -> np.ndarray:
+    """Vectorized gapfill_linear applied independently to every column of a 2-D array.
+
+    `arr` is (n_steps, n_pixels); gaps are filled along axis 0 (the time axis), matching
+    gapfill_linear's per-series semantics exactly (interior NaNs linearly interpolated,
+    leading/trailing NaNs held flat at the nearest valid value) -- but for every pixel
+    column at once, so a raster-block classify pass never loops pixels for this step.
+    Columns that are entirely NaN are returned unchanged (still all-NaN).
+    """
+    arr = np.asarray(arr, dtype=float)
+    n_steps, n_pixels = arr.shape
+    step_idx = np.arange(n_steps)
+    valid = ~np.isnan(arr)
+
+    # Index of the previous/next valid sample per column (forward/backward filled row index).
+    fwd_src = np.where(valid, step_idx[:, None], -1)
+    prev_idx = np.maximum.accumulate(fwd_src, axis=0)
+    bwd_src = np.where(valid, step_idx[:, None], n_steps)
+    next_idx = np.minimum.accumulate(bwd_src[::-1], axis=0)[::-1]
+
+    cols = np.arange(n_pixels)[None, :]
+    prev_val = arr[np.clip(prev_idx, 0, n_steps - 1), cols]
+    next_val = arr[np.clip(next_idx, 0, n_steps - 1), cols]
+
+    span = (next_idx - prev_idx).astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        weight = np.where(span > 0, (step_idx[:, None] - prev_idx) / span, 0.0)
+    interpolated = prev_val + weight * (next_val - prev_val)
+
+    out = np.where(valid, arr, interpolated)
+    out = np.where(~valid & (prev_idx < 0), next_val, out)  # before first valid: hold flat
+    out = np.where(~valid & (next_idx >= n_steps), prev_val, out)  # after last valid: hold flat
+
+    all_nan_cols = ~valid.any(axis=0)
+    if all_nan_cols.any():
+        out[:, all_nan_cols] = np.nan
+    return out
+
+
+def smooth_savgol_batch(arr: np.ndarray, cfg: dict) -> np.ndarray:
+    """Vectorized smooth_savgol applied along axis 0 (time) of a 2-D (n_steps, n_pixels) array.
+
+    Uses scipy's native axis= support, so this is a single call rather than a per-pixel loop;
+    the window-vs-series-length clamping mirrors smooth_savgol's (based on n_steps, constant
+    for the whole raster since every pixel shares the same band count).
+    """
+    arr = np.asarray(arr, dtype=float)
+    window = cfg["timeseries"]["savgol_window"]
+    polyorder = cfg["timeseries"]["savgol_polyorder"]
+    n_steps = arr.shape[0]
+
+    if window > n_steps:
+        window = n_steps if n_steps % 2 == 1 else n_steps - 1
+    if window <= polyorder:
+        return arr
+    return savgol_filter(arr, window_length=window, polyorder=polyorder, axis=0)
+
+
 def _longest_run(mask: np.ndarray) -> int:
     """Length of the longest contiguous run of True values in mask."""
     longest = 0

@@ -1,6 +1,8 @@
 # Phase 1 (classical baseline) only — DL deps (torch/terratorch/clay/sam2) arrive in Phase 3.
 earthengine-api
 geemap
+geedim
+rio-cogeo
 geopandas
 rasterio
 rioxarray
