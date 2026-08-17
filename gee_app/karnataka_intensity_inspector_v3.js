@@ -628,6 +628,12 @@ function onDistrictChange(name) {
 var classifiedRaw = ee.Image(CLASSIFIED_ASSET_ID);
 var classifiedImage = classifiedRaw.updateMask(classifiedRaw.neq(255));
 
+// The validated-map asset may not have been uploaded yet. Probed async at
+// startup (see MAP SETUP); until confirmed, every click uses the live path
+// and the legend explains why. Uploading the asset later auto-upgrades the
+// app on its next load -- no code change needed.
+var validatedAssetAvailable = false;
+
 // ----------------------------------------------------------------------
 // RESULTS PANEL HELPERS
 // resultsPanel is built from persistent slots (locationLabel, classLabel,
@@ -825,7 +831,7 @@ function inspectPoint(lon, lat) {
 
     buildPhotoStrip(photoRegion, yearCfg, myRequestId);
 
-    var useValidated = flags.inRaichur && yearCfg.validatedAssetEligible;
+    var useValidated = flags.inRaichur && yearCfg.validatedAssetEligible && validatedAssetAvailable;
     if (useValidated) {
       inspectValidated(point, ndviComposites, vhComposites, yearCfg, myRequestId);
     } else {
@@ -897,11 +903,22 @@ function inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, m
 // ----------------------------------------------------------------------
 Map.setOptions('HYBRID');
 
-Map.addLayer(
-  classifiedImage,
-  {min: 0, max: 4, palette: PALETTE},
-  INTENSITY_LAYER_NAME
-);
+// Add the validated-map layer only if the asset actually exists: an eager
+// addLayer on a missing asset surfaces a permanent layer error. The probe
+// resolves after startup, so it also refreshes the legend note and applies
+// the current year's visibility itself.
+classifiedImage.bandNames().evaluate(function(bandNames, error) {
+  if (!error && bandNames && bandNames.length) {
+    validatedAssetAvailable = true;
+    Map.addLayer(
+      classifiedImage,
+      {min: 0, max: 4, palette: PALETTE},
+      INTENSITY_LAYER_NAME,
+      currentYearCfg.validatedAssetEligible
+    );
+  }
+  updateLegendForYear(currentYearCfg);
+});
 
 // ----------------------------------------------------------------------
 // LEGEND (bottom-left panel) -- verbatim from v1.
@@ -946,7 +963,12 @@ legend.add(legendYearNote);
 Map.add(legend);
 
 function updateLegendForYear(yearCfg) {
-  if (yearCfg.validatedAssetEligible) {
+  if (!validatedAssetAvailable) {
+    legendYearNote.setValue(
+      'Validated 2024-25 map not uploaded yet -- all results are computed ' +
+      'live (same algorithm). Upload asset raichur_intensity_2024_25 to enable it.'
+    );
+  } else if (yearCfg.validatedAssetEligible) {
     legendYearNote.setValue('');
   } else {
     legendYearNote.setValue(
