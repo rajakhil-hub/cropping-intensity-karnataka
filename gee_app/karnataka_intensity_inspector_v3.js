@@ -572,14 +572,23 @@ function setLayerShownByName(name, shown) {
 var raichurFeature;
 var currentState = {};
 
-function applyStateSelection(stateCfg) {
+// Pure-data initialization (no ui calls). Kept separate from
+// applyStateSelection and invoked at load right below, so the click/Go
+// handlers always have boundary collections even if something later in the
+// UI assembly fails -- a load-order abort here previously surfaced as
+// "Cannot read property 'filterBounds' of undefined" at click time.
+function initStateData(stateCfg) {
   currentState.cfg = stateCfg;
   currentState.level1 = ee.FeatureCollection('FAO/GAUL/2015/level1')
     .filter(ee.Filter.eq('ADM1_NAME', stateCfg.gaulAdm1));
   currentState.districtsFC = ee.FeatureCollection('FAO/GAUL/2015/level2')
     .filter(ee.Filter.eq('ADM1_NAME', stateCfg.gaulAdm1));
-
   raichurFeature = currentState.districtsFC.filter(ee.Filter.eq('ADM2_NAME', 'Raichur'));
+}
+initStateData(STATE_CONFIGS[0]);
+
+function applyStateSelection(stateCfg) {
+  initStateData(stateCfg);
 
   Map.setCenter(stateCfg.center.lon, stateCfg.center.lat, stateCfg.center.zoom);
   removeLayerByName('district outline');
@@ -1126,13 +1135,11 @@ var sidePanel = ui.Panel({
   style: {width: '350px'}
 });
 
-var mainPanel = ui.Panel({
-  widgets: [Map, sidePanel],
-  layout: ui.Panel.Layout.Flow('horizontal'),
-  style: {stretch: 'both'}
-});
-Map.style().set('stretch', 'both');
-ui.root.widgets().reset([mainPanel]);
+// Attach the side panel directly to ui.root instead of reparenting the
+// default Map into a nested panel: the reparenting pattern aborts script
+// load in the real Code Editor, leaving startup un-run (root cause of the
+// "Cannot read property 'filterBounds' of undefined" click error).
+ui.root.insert(1, sidePanel);
 
 // ----------------------------------------------------------------------
 // CLICK HANDLER
