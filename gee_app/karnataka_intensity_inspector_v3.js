@@ -173,6 +173,31 @@ var PEAKS_CFG = {
 var BUFFER_RADIUS_M = 100; // small point buffer used as the "region" for live extraction/classification
 var GO_ZOOM = 16; // map zoom level after "Go to coordinates"
 
+// Draw-an-area sampled cropping-intensity estimate (see analyzeArea() below
+// and gee_app/README.md). Random-point sampling + the same client-side
+// countCycles() used for per-field clicks, validated end-to-end against
+// live GEE on a 2,486 ha command-area block: N=200 -> 7s, N=500 -> 6s,
+// cropping intensity 194.2% vs 193.4% (stable), consistent class tallies.
+var AREA_SAMPLE_N = 500;        // ~+/-4.4% margin at 95% confidence; ~6s round trip
+var AREA_SAMPLE_SEED = 42;      // fixed so repeat runs of the same area agree
+// Measured: a whole district (Raichur, ~846,500 ha) completes in ~56 s, and its
+// sampled cropping intensity came back 128.6% against 128.5% from the 7-hour
+// wall-to-wall raster classification -- so district-sized draws are supported.
+// The cap exists only to stop runaway draws, not to stop districts.
+var AREA_MAX_HA = 1000000;
+var AREA_SLOW_HA = 100000;      // above this, warn the user it takes ~a minute
+var AREA_LAYER_NAME = 'drawn area';
+
+// Water use (MODIS MOD16A2GF, 463 m, 8-day, gap-filled). Deliberately area-only:
+// one pixel covers ~20 ha, so this can never be a per-field number. Reported as
+// actual ET, and as ET/PET -- water actually used against atmospheric demand,
+// which is comparable across areas and seasons and reads as an irrigation index.
+// Measured over the 2024-25 agri-year: command-area block ET 760 mm / ET/PET
+// 0.36, rainfed block ET 567 mm / ET/PET 0.24.
+var ET_COLLECTION_ID = 'MODIS/061/MOD16A2GF';
+var ET_SCALE_M = 463;
+var ET_UNIT_SCALE = 0.1;        // MOD16A2 ET/PET are stored as 0.1 mm
+
 // State configs: one entry per state this app supports. Only Karnataka is
 // wired up today; add more entries here (each with its own GAUL ADM1 name
 // and map-center/zoom) to extend to other states later.
@@ -1065,6 +1090,305 @@ function inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, m
 }
 
 // ----------------------------------------------------------------------
+// AREA ANALYSIS (draw-a-rectangle sampled cropping-intensity estimate)
+// Area statistics cannot reuse the per-pixel client-side classifier
+// directly, and re-implementing count_cycles server-side would risk
+// diverging from the validated map. Instead: randomly sample points across
+// the drawn area, pull all N_PERIODS NDVI periods for every sample in ONE
+// round trip, and run the existing client-side countCycles() on each
+// sample -- reusing the exact validated algorithm while staying fast. This
+// is a separate flow from inspectPoint()/inspectLive() above -- per-field
+// click inspection is untouched and remains the way to spot-check a single
+// field's classification against an area estimate.
+// ----------------------------------------------------------------------
+var areaRequestId = 0;
+
+// Documented Earth Engine idiom for clearing all drawn geometries (leaves
+// the drawing-tools layer list itself intact, just empty).
+function clearDrawnGeometries() {
+  var layers = Map.drawingTools().layers();
+  layers.forEach(function(layer) {
+    layers.remove(layer);
+  });
+}
+
+function areaPanelHeader() {
+  return ui.Label({
+    value: 'Area analysis',
+    style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 4px 0'}
+  });
+}
+
+function clearAreaResults() {
+  areaPanel.clear();
+  areaPanel.add(areaPanelHeader());
+  areaPanel.add(ui.Label({
+    value: 'Draw a rectangle on the map ("Draw area", top-left) to estimate ' +
+      'cropping intensity across an area from sampled points.',
+    style: {fontSize: '11px', color: '#666666', margin: '0'}
+  }));
+}
+
+function showAreaStatus(msg) {
+  areaPanel.clear();
+  areaPanel.add(areaPanelHeader());
+  areaPanel.add(ui.Label({value: msg, style: {color: '#888888', margin: '0'}}));
+}
+
+function showAreaError(msg) {
+  areaPanel.clear();
+  areaPanel.add(areaPanelHeader());
+  areaPanel.add(ui.Label({value: msg, style: {color: '#cc0000', margin: '0'}}));
+}
+
+// One row: class-color swatch + label + hectares + percent (sample count
+// folded into the percent cell, e.g. "23.8% (n=100)"), matching the
+// CLASS_INFO legend used for the map layer.
+function makeAreaClassRow(classInfo, haText, pctText, count) {
+  var swatch = ui.Label({style: {backgroundColor: classInfo.color, padding: '6px', margin: '2px 4px 0 0'}});
+  var label = ui.Label({value: classInfo.label, style: {fontSize: '11px', width: '150px', margin: '2px 4px 0 0'}});
+  var haLabel = ui.Label({value: haText, style: {fontSize: '11px', width: '65px', margin: '2px 4px 0 0'}});
+  var pctLabel = ui.Label({value: pctText + ' (n=' + count + ')', style: {fontSize: '11px', margin: '2px 0 0 0'}});
+  return ui.Panel({
+    widgets: [swatch, label, haLabel, pctLabel],
+    layout: ui.Panel.Layout.Flow('horizontal'),
+    style: {margin: '0'}
+  });
+}
+
+// Tallies countCycles() over every sampled feature's NDVI series (same band
+// keys and missing-value handling as inspectLive) and renders the headline
+// cropping-intensity number + per-class hectare/percent table into
+// areaPanel. Nodata (classId 255) samples are counted and shown separately,
+// never folded into the class 0-4 tallies used for hectares/percent/intensity.
+function finishAreaAnalysis(areaHa, sampleFc, yearCfg) {
+  var features = (sampleFc && sampleFc.features) || [];
+  var classCounts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0};
+  var nodataCount = 0;
+
+  for (var i = 0; i < features.length; i++) {
+    var props = features[i].properties || {};
+    var values = [];
+    for (var j = 0; j < N_PERIODS; j++) {
+      var key = 'ndvi_' + pad2(j);
+      var v = props[key];
+      values.push(v === undefined ? null : v);
+    }
+    var result = countCycles(values, COMPOSITE_DAYS, PEAKS_CFG);
+    if (result.classId === 255) {
+      nodataCount++;
+    } else {
+      classCounts[result.classId] = (classCounts[result.classId] || 0) + 1;
+    }
+  }
+
+  var nSampled = features.length;
+  var nValid = nSampled - nodataCount;
+
+  areaPanel.clear();
+  areaPanel.add(areaPanelHeader());
+
+  if (nValid <= 0) {
+    areaPanel.add(ui.Label({
+      value: 'All ' + nSampled + ' sample points were nodata (cloud-obscured/masked) for ' +
+        yearCfg.label + ' -- try a different area or agricultural year.',
+      style: {color: '#cc0000', margin: '0'}
+    }));
+    return;
+  }
+
+  var ha = {}, pct = {};
+  for (var c = 0; c <= 4; c++) {
+    pct[c] = classCounts[c] / nValid;
+    ha[c] = pct[c] * areaHa;
+  }
+  var croppedHa = ha[1] + ha[2] + ha[3];
+  var grossCroppedHa = ha[1] + 2 * ha[2] + 3 * ha[3];
+  var intensityText = croppedHa > 0 ? (grossCroppedHa / croppedHa * 100).toFixed(1) + '%' : 'N/A';
+  var marginPct = 1.96 * Math.sqrt(0.25 / nValid) * 100;
+
+  areaPanel.add(ui.Label({
+    value: 'Cropping intensity: ' + intensityText,
+    style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 2px 0'}
+  }));
+  areaPanel.add(ui.Label({
+    value: 'Area: ' + areaHa.toFixed(1) + ' ha (' + yearCfg.label + ')',
+    style: {fontWeight: 'bold', fontSize: '12px', margin: '0 0 6px 0'}
+  }));
+
+  CLASS_INFO.forEach(function(c) {
+    var haText = ha[c.value].toFixed(1) + ' ha';
+    var pctText = (pct[c.value] * 100).toFixed(1) + '%';
+    areaPanel.add(makeAreaClassRow(c, haText, pctText, classCounts[c.value]));
+  });
+
+  if (nodataCount > 0) {
+    areaPanel.add(ui.Label({
+      value: nodataCount + ' of ' + nSampled + ' sample points were nodata (cloud-obscured/masked) ' +
+        'and are excluded from the classes above.',
+      style: {fontSize: '10px', color: '#888888', margin: '6px 0 0 0'}
+    }));
+  }
+  areaPanel.add(ui.Label({
+    value: nValid + ' valid samples, ±' + marginPct.toFixed(1) + '% margin of error at 95% confidence.',
+    style: {fontSize: '10px', color: '#666666', margin: '4px 0 0 0'}
+  }));
+  areaPanel.add(ui.Label({
+    value: 'Statistical estimate from randomly sampled points -- not a wall-to-wall pixel count.',
+    style: {fontSize: '10px', color: '#666666', margin: '2px 0 0 0'}
+  }));
+}
+
+function analyzeArea(geometry) {
+  areaRequestId++;
+  var myAreaId = areaRequestId;
+  var yearCfg = currentYearCfg;
+
+  var outlineFc = ee.FeatureCollection([ee.Feature(geometry)]);
+  var outline = ee.Image().byte().paint({featureCollection: outlineFc, color: 0, width: 2});
+  replaceMapLayer(AREA_LAYER_NAME, outline, {palette: ['#1a73e8']});
+
+  showAreaStatus('Checking area size...');
+
+  // Guard BEFORE the heavy sampling call: a small, fast evaluate of just the
+  // area, so an absurdly large draw never reaches reduceRegions() (which
+  // would filter/join Sentinel-2 + CloudScore+ over the whole region).
+  geometry.area(1).evaluate(function(areaM2, areaErr) {
+    if (myAreaId !== areaRequestId) return;
+    if (areaErr || typeof areaM2 !== 'number') {
+      showAreaError('Error reading drawn area size: ' + (areaErr || 'no result'));
+      return;
+    }
+
+    var areaHaCheck = areaM2 / 1e4;
+    if (areaHaCheck > AREA_MAX_HA) {
+      showAreaError(
+        'Drawn area is ~' + Math.round(areaHaCheck) + ' ha, above the ' + AREA_MAX_HA +
+        ' ha cap -- draw a smaller area.'
+      );
+      return;
+    }
+
+    showAreaStatus(areaHaCheck > AREA_SLOW_HA
+      ? 'Analysing ' + Math.round(areaHaCheck) + ' ha (' + AREA_SAMPLE_N +
+        ' sample points) -- large areas take about a minute...'
+      : 'Analysing area (' + AREA_SAMPLE_N + ' sample points)...');
+
+    var extractionImage = buildNdviExtractionImage(geometry, yearCfg);
+    var samplePts = ee.FeatureCollection.randomPoints({
+      region: geometry, points: AREA_SAMPLE_N, seed: AREA_SAMPLE_SEED
+    });
+
+    // ONE round trip for both the (re-derived, still cheap) area and the
+    // sampled NDVI series -- see gee_app/README.md for the measured timing.
+    var payload = ee.Dictionary({
+      areaHa: geometry.area(1).divide(1e4),
+      samples: extractionImage.reduceRegions({
+        collection: samplePts, reducer: ee.Reducer.first(), scale: SCALE_M
+      })
+    });
+
+    payload.evaluate(function(result, error) {
+      if (myAreaId !== areaRequestId) return;
+      if (error || !result) {
+        showAreaError('Error analysing area: ' + (error || 'no result returned'));
+        return;
+      }
+      finishAreaAnalysis(result.areaHa, result.samples, yearCfg);
+      addAreaWaterUse(geometry, yearCfg, myAreaId);
+    });
+  });
+}
+
+// Appends the MODIS ET summary under the class table. Runs as its own round
+// trip after the class results are already on screen, so the (slower, coarser)
+// water figures never hold up the cropping-intensity answer.
+function addAreaWaterUse(geometry, yearCfg, myAreaId) {
+  var pending = ui.Label({
+    value: 'Loading water use...',
+    style: {fontSize: '10px', color: '#888888', margin: '6px 0 0 0'}
+  });
+  areaPanel.add(pending);
+
+  var et = ee.ImageCollection(ET_COLLECTION_ID)
+    .filterDate(yearCfg.agriStart, yearCfg.agriEnd);
+
+  function areaMeanSum(band) {
+    return et.select(band).sum().multiply(ET_UNIT_SCALE)
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: geometry,
+        scale: ET_SCALE_M,
+        maxPixels: 1e9,
+        bestEffort: true
+      }).get(band);
+  }
+
+  // Twelve monthly means, so the curve can show the crop cycles independently
+  // of NDVI. Measured on a command block: peaks in Sep-Oct (kharif) and
+  // Feb-Mar (rabi) -- water use reproduces the double-cropping signal.
+  var monthly = ee.List.sequence(0, 11).map(function(m) {
+    var start = ee.Date(yearCfg.agriStart).advance(m, 'month');
+    return et.select('ET').filterDate(start, start.advance(1, 'month'))
+      .sum().multiply(ET_UNIT_SCALE)
+      .reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: geometry,
+        scale: ET_SCALE_M,
+        maxPixels: 1e9,
+        bestEffort: true
+      }).get('ET');
+  });
+
+  ee.Dictionary({et: areaMeanSum('ET'), pet: areaMeanSum('PET'), monthly: monthly})
+    .evaluate(function(res, err) {
+      if (myAreaId !== areaRequestId) return;
+      areaPanel.remove(pending);
+
+      if (err || !res || typeof res.et !== 'number') {
+        areaPanel.add(ui.Label({
+          value: 'Water use unavailable for this area/year.',
+          style: {fontSize: '10px', color: '#888888', margin: '6px 0 0 0'}
+        }));
+        return;
+      }
+
+      areaPanel.add(ui.Label({
+        value: 'Water use (area scale)',
+        style: {fontWeight: 'bold', fontSize: '12px', margin: '8px 0 2px 0'}
+      }));
+      var ratioText = (typeof res.pet === 'number' && res.pet > 0)
+        ? (res.et / res.pet).toFixed(2)
+        : 'N/A';
+      areaPanel.add(ui.Label({
+        value: 'Actual ET ' + Math.round(res.et) + ' mm  |  ET/PET ' + ratioText +
+          '  (higher = more irrigated)',
+        style: {fontSize: '11px', margin: '0 0 2px 0'}
+      }));
+
+      var values = [];
+      var labels = [];
+      for (var m = 0; m < 12; m++) {
+        var v = (res.monthly && typeof res.monthly[m] === 'number') ? res.monthly[m] : 0;
+        values.push(v);
+        labels.push(MONTH_ABBR[(5 + m) % 12]);
+      }
+      areaPanel.add(ui.Chart.array.values(ee.Array(values), 0, labels).setOptions({
+        title: 'Monthly water use (mm)',
+        legend: {position: 'none'},
+        hAxis: {title: ''},
+        vAxis: {title: 'ET (mm)'},
+        height: 130
+      }).setChartType('ColumnChart'));
+
+      areaPanel.add(ui.Label({
+        value: 'MODIS 463 m -- area-scale context only, never a per-field figure.',
+        style: {fontSize: '10px', color: '#666666', margin: '2px 0 0 0'}
+      }));
+    });
+}
+
+// ----------------------------------------------------------------------
 // MAP SETUP
 // ----------------------------------------------------------------------
 Map.setOptions('HYBRID');
@@ -1240,6 +1564,37 @@ var goRow = ui.Panel({
   layout: ui.Panel.Layout.Flow('horizontal')
 });
 
+// Draw-area / clear-area buttons -- see analyzeArea() and the "AREA DRAWING
+// SETUP" section below for the drawingTools wiring these trigger.
+var drawAreaButton = ui.Button({
+  label: 'Draw area',
+  onClick: function() {
+    areaRequestId++; // invalidate any in-flight analyzeArea from a previous draw
+    clearDrawnGeometries();
+    removeLayerByName(AREA_LAYER_NAME);
+    showAreaStatus('Draw a rectangle on the map, then release to analyse it.');
+    Map.drawingTools().setShape('rectangle');
+    Map.drawingTools().setShown(true);
+    Map.drawingTools().draw();
+  }
+});
+
+var clearAreaButton = ui.Button({
+  label: 'Clear area',
+  onClick: function() {
+    areaRequestId++; // invalidate any in-flight analyzeArea callback
+    clearDrawnGeometries();
+    removeLayerByName(AREA_LAYER_NAME);
+    Map.drawingTools().setShape(null);
+    clearAreaResults();
+  }
+});
+
+var areaButtonRow = ui.Panel({
+  widgets: [drawAreaButton, clearAreaButton],
+  layout: ui.Panel.Layout.Flow('horizontal')
+});
+
 var controlPanel = ui.Panel({
   widgets: [
     ui.Label({value: 'Karnataka Cropping Inspector', style: {fontWeight: 'bold', fontSize: '15px', margin: '4px 4px 8px 4px'}}),
@@ -1251,7 +1606,9 @@ var controlPanel = ui.Panel({
     districtSelect,
     ui.Label({value: 'Go to coordinates', style: {margin: '8px 4px 2px 4px'}}),
     goRow,
-    goErrorLabel
+    goErrorLabel,
+    ui.Label({value: 'Draw an area', style: {margin: '8px 4px 2px 4px'}}),
+    areaButtonRow
   ],
   layout: ui.Panel.Layout.Flow('vertical'),
   style: {position: 'top-left', width: '260px', padding: '8px'}
@@ -1269,7 +1626,8 @@ var headerPanel = ui.Panel({
       style: {fontWeight: 'bold', fontSize: '20px', margin: '8px 8px 4px 8px'}
     }),
     ui.Label({
-      value: 'Pick a state and district, use "Go to coordinates", or click any point on the map to inspect that field.',
+      value: 'Pick a state and district, use "Go to coordinates", or click any point on the map to ' +
+        'inspect that field. Use "Draw area" (top-left) to estimate cropping intensity across a larger area.',
       style: {margin: '0 8px 8px 8px', color: '#444444'}
     })
   ],
@@ -1286,8 +1644,18 @@ var resultsPanel = ui.Panel({
   style: {margin: '4px 0'}
 });
 
+// Draw-an-area sampled results -- a separate persistent slot from
+// resultsPanel above (the per-field click/Go spot-check), cleared and
+// rebuilt by analyzeArea() the same way photoStripPanel/chartsPanel are
+// rebuilt per click, so the two flows never interfere with each other.
+var areaPanel = ui.Panel({
+  layout: ui.Panel.Layout.Flow('vertical'),
+  style: {margin: '4px 8px 8px 8px', padding: '6px', backgroundColor: '#f4f4f4'}
+});
+clearAreaResults();
+
 var sidePanel = ui.Panel({
-  widgets: [headerPanel, resultsPanel],
+  widgets: [headerPanel, areaPanel, resultsPanel],
   layout: ui.Panel.Layout.Flow('vertical'),
   style: {width: '350px'}
 });
@@ -1297,6 +1665,21 @@ var sidePanel = ui.Panel({
 // load in the real Code Editor, leaving startup un-run (root cause of the
 // "Cannot read property 'filterBounds' of undefined" click error).
 ui.root.insert(1, sidePanel);
+
+// ----------------------------------------------------------------------
+// AREA DRAWING SETUP
+// Configured once at startup. setLinked(false) keeps the drawn shape as a
+// plain on-map geometry rather than also creating an importable script
+// variable (this is a throwaway analysis shape, not a script import).
+// onDraw fires once a shape is completed; setShape(null) immediately after
+// hands map clicks back to the CLICK HANDLER below, so drawing and
+// click-to-inspect never fight over the same click.
+// ----------------------------------------------------------------------
+Map.drawingTools().setLinked(false);
+Map.drawingTools().onDraw(function(geometry) {
+  Map.drawingTools().setShape(null);
+  analyzeArea(geometry);
+});
 
 // ----------------------------------------------------------------------
 // CLICK HANDLER

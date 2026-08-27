@@ -165,3 +165,70 @@ Go-to-coordinates, click-to-inspect, NDVI/VH charts) works the same as v2.
 Once it runs cleanly: **Apps** (top-right) -> **Publish new App** -> point it
 at this script. Produces a standalone URL for field teams (no code editor, no
 GEE account required).
+
+### Draw-an-area cropping-intensity analysis
+
+v3 also adds an area-level estimate alongside the per-field click inspection
+above:
+
+- Click **Draw area** (top-left panel) to arm the map's drawing tool (a
+  rectangle by default; the on-map drawing toolbar this reveals also lets you
+  switch to the polygon tool). Draw the shape and release the mouse to run
+  the analysis; **Clear area** removes the drawn shape and its result.
+- **Why sampling, not a wall-to-wall count**: the per-pixel classifier used
+  for map clicks/the validated asset runs client-side in the browser and
+  isn't something a whole drawn area can be run through directly, and
+  re-implementing `count_cycles` server-side in GEE would risk diverging from
+  the validated map. Instead, the app draws `AREA_SAMPLE_N` (default 500)
+  random points inside the drawn area, pulls the full 25-period NDVI series
+  for every point in one batched Earth Engine call, and classifies each point
+  client-side with the exact same `countCycles` port used everywhere else in
+  this app. This was measured end-to-end against live GEE on a 2,486 ha
+  command-area block: N=200 took ~7 s, N=500 took ~6 s, with cropping
+  intensity estimates of 194.2% and 193.4% respectively (stable) and
+  consistent per-class tallies.
+- The results panel (above the per-field results) shows, in order: the
+  headline **cropping intensity** --
+  `(1*ha_single + 2*ha_double + 3*ha_triple) / (ha_single + ha_double + ha_triple) x 100`
+  -- the drawn area size, then a per-class row (color swatch, label,
+  hectares, % of valid samples) using the same colors as the map legend.
+  Nodata (cloud-obscured/masked) sample points are counted and shown
+  separately and are never folded into the class percentages or the
+  intensity calculation.
+- The panel states the sample size actually used and the resulting margin of
+  error (`1.96 * sqrt(0.25 / n) * 100`, e.g. "500 samples, +/-4.4% at 95%
+  confidence") and explicitly notes that this is a **statistical estimate
+  from sampled points, not a wall-to-wall pixel count**.
+- Areas larger than `AREA_MAX_HA` (1,000,000 ha) are refused with a message to
+  draw a smaller one -- a guard against runaway compute, checked before the
+  sampling call runs. Above `AREA_SLOW_HA` (100,000 ha) the status line warns
+  that the run takes about a minute. District-sized draws are supported: whole
+  Raichur (~846,500 ha) completes in ~56 s.
+- **Accuracy of the sampling method**: over all of Raichur it returned 128.6%
+  cropping intensity against 128.5% from the 7-hour wall-to-wall raster
+  classification -- agreement to 0.1 percentage points, roughly 450x faster.
+  It also separates the extremes cleanly: a canal-command block reads ~194%
+  (mostly double-cropped) and a rainfed block ~101% (93.6% single-cropped).
+- **Per-field click inspection is unchanged** and remains the recommended way
+  to spot-check one specific field's classification against an area's
+  estimate.
+
+### Water use (area scale only)
+
+Under the class table, each drawn area also reports evapotranspiration from
+MODIS `MOD16A2GF` (463 m, 8-day, gap-filled), loaded in its own round trip so
+it never delays the cropping-intensity answer.
+
+- **Actual ET (mm)** for the agricultural year, averaged over the drawn area.
+- **ET/PET ratio** -- water actually used against atmospheric demand. This is
+  the more comparable number across areas and seasons, and reads as an
+  irrigation index. Measured for 2024-25: canal-command block 0.36 (ET 760 mm),
+  rainfed block 0.24 (ET 567 mm), whole Raichur 0.27 (ET 599 mm).
+- **Monthly water-use chart**, which acts as an independent cross-check on the
+  NDVI-derived classification: over the command block it peaks in Sep-Oct
+  (kharif) and again in Feb-Mar (rabi), reproducing the double-cropping cycle
+  from a completely separate physical measurement.
+- MODIS ET is 463 m -- one pixel covers ~20 ha, so it **cannot resolve a single
+  field**. It is labelled area-scale context in the UI and is deliberately never
+  shown in the per-field panel. Field-scale canopy signals (NDVI, and the
+  SL2P LAI in `src/cropint/gee/biophysical.py`) stay at 10 m.
