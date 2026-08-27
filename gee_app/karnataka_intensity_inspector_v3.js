@@ -186,6 +186,16 @@ var AREA_SAMPLE_SEED = 42;      // fixed so repeat runs of the same area agree
 // The cap exists only to stop runaway draws, not to stop districts.
 var AREA_MAX_HA = 1000000;
 var AREA_SLOW_HA = 100000;      // above this, warn the user it takes ~a minute
+
+// Zoom level for the sub-metre inset view of a clicked field.
+var FIELD_INSET_ZOOM = 17;
+// The classification layer is a solid colour fill, so at field-inspection zoom
+// it completely hides the imagery underneath -- which is exactly when you want
+// to SEE the field. Render it semi-transparent, and drop it out automatically
+// once zoomed in past this level (the main map's own layer checkbox still wins
+// if the user re-enables it manually).
+var INTENSITY_LAYER_OPACITY = 0.55;
+var INTENSITY_HIDE_ZOOM = 14;
 var AREA_LAYER_NAME = 'drawn area';
 
 // Water use (MODIS MOD16A2GF, 463 m, 8-day, gap-filled). Deliberately area-only:
@@ -994,6 +1004,17 @@ function inspectPoint(lon, lat) {
   var latR = Math.round(lat * 10000) / 10000;
 
   locationLabel.setValue('Location: ' + lonR + ', ' + latR);
+
+  // Point the sub-metre inset at this field. Rebuild its single marker layer
+  // rather than stacking one per click.
+  fieldInsetMap.setCenter(lon, lat, FIELD_INSET_ZOOM);
+  fieldInsetMap.layers().reset([
+    ui.Map.Layer(point, {color: 'FF0000'}, 'clicked point')
+  ]);
+  fieldInsetCaption.setValue(
+    'High-resolution view (Google basemap, undated) -- for seeing the field. ' +
+    'The dated 10 m monthly frames below are what the classification uses.'
+  );
   classLabel.setValue('Loading field data...');
   classLabel.style().set('color', '#888888');
   photoStripPanel.clear();
@@ -1393,6 +1414,17 @@ function addAreaWaterUse(geometry, yearCfg, myAreaId) {
 // ----------------------------------------------------------------------
 Map.setOptions('HYBRID');
 
+// Hide the solid classification fill once zoomed in to field level, so the
+// imagery underneath is actually visible; show it again when zoomed back out
+// to the area scale where it is the point of the map.
+function applyIntensityZoomVisibility() {
+  if (!validatedAssetAvailable) return;
+  var zoom = Map.getZoom();
+  var showByYear = currentYearCfg.validatedAssetEligible;
+  setLayerShownByName(INTENSITY_LAYER_NAME, showByYear && zoom < INTENSITY_HIDE_ZOOM);
+}
+Map.onChangeZoom(applyIntensityZoomVisibility);
+
 // Add the validated-map layer only if the asset actually exists: an eager
 // addLayer on a missing asset surfaces a permanent layer error. The probe
 // resolves after startup, so it also refreshes the legend note and applies
@@ -1404,8 +1436,10 @@ classifiedImage.bandNames().evaluate(function(bandNames, error) {
       classifiedImage,
       {min: 0, max: 4, palette: PALETTE},
       INTENSITY_LAYER_NAME,
-      currentYearCfg.validatedAssetEligible
+      currentYearCfg.validatedAssetEligible,
+      INTENSITY_LAYER_OPACITY
     );
+    applyIntensityZoomVisibility();
   }
   updateLegendForYear(currentYearCfg);
 });
@@ -1476,7 +1510,10 @@ function updateLegendForYear(yearCfg) {
 // ----------------------------------------------------------------------
 function applyYearSelection(yearCfg) {
   currentYearCfg = yearCfg;
-  setLayerShownByName(INTENSITY_LAYER_NAME, yearCfg.validatedAssetEligible);
+  // Visibility is the AND of "this year has a validated asset" and "we are
+  // zoomed out far enough for a solid fill to be useful" -- both rules live in
+  // applyIntensityZoomVisibility so they cannot disagree.
+  applyIntensityZoomVisibility();
   updateLegendForYear(yearCfg);
   if (lastClickedPoint) {
     inspectPoint(lastClickedPoint.lon, lastClickedPoint.lat);
@@ -1636,10 +1673,29 @@ var headerPanel = ui.Panel({
 
 var locationLabel = ui.Label({style: {fontWeight: 'bold', margin: '8px 8px 2px 8px'}});
 var classLabel = ui.Label({style: {margin: '0 8px 8px 8px'}});
+
+// Sub-metre view of the clicked field. Sentinel-2 is 10 m, so the monthly photo
+// strip physically cannot show field detail -- and there is no free sub-10 m
+// satellite imagery over India in Earth Engine (checked: Planet NICFI's free
+// programme ended, SkySat has zero scenes over Raichur, everything else is
+// US/Brazil-only or commercial). Google's *basemap*, however, is sub-metre and
+// free inside an app, so this inset gives the clear "what does my field look
+// like" picture. It is an undated mosaic, which is why it complements rather
+// than replaces the dated 10 m monthly strip below.
+var fieldInsetMap = ui.Map();
+fieldInsetMap.setOptions('SATELLITE');
+fieldInsetMap.setControlVisibility({
+  all: false, zoomControl: true, mapTypeControl: true
+});
+fieldInsetMap.style().set({height: '220px', margin: '0 8px 4px 8px'});
+var fieldInsetCaption = ui.Label({
+  value: '',
+  style: {fontSize: '10px', color: '#666666', margin: '0 8px 8px 8px'}
+});
 var photoStripPanel = ui.Panel({layout: ui.Panel.Layout.Flow('vertical'), style: {margin: '0 8px 8px 8px'}});
 var chartsPanel = ui.Panel({layout: ui.Panel.Layout.Flow('vertical'), style: {margin: '0 8px'}});
 var resultsPanel = ui.Panel({
-  widgets: [locationLabel, classLabel, photoStripPanel, chartsPanel],
+  widgets: [locationLabel, classLabel, fieldInsetMap, fieldInsetCaption, photoStripPanel, chartsPanel],
   layout: ui.Panel.Layout.Flow('vertical'),
   style: {margin: '4px 0'}
 });
