@@ -124,9 +124,21 @@ Go-to-coordinates, click-to-inspect, NDVI/VH charts) works the same as v2.
   selected, and a red note appears under the legend explaining why.
 - **12-month field-photo strip**: for the currently inspected point, a small
   grid of Sentinel-2 true-color (B4/B3/B2) thumbnails, one per calendar month
-  of the selected agri-year (Jun through May), sourced from a ~300 m box
+  of the selected agri-year (Jun through May), sourced from a ~200 m box
   around the point (independent of the ~200 m NDVI/VH extraction region).
-  Each thumbnail loads a small preview synchronously; a matching
+  Each cell renders the **clearest single Sentinel-2 scene** over that box
+  for the month (ranked by mean CloudScore+ `cs_cdf` over the box) when one
+  clears `PHOTO_CLEAR_THRESHOLD`; a single scene is sharper than a median
+  because it isn't blending pixels from different dates. Cloudy months, where
+  no scene is clear enough, fall back to a same-month median composite and
+  are marked **"(composite)"** in grey under the thumbnail. Thumbnails render
+  at 256 px (longest side) and full-size links at 768 px (both up from
+  100x100/512), using bicubic resampling and a projected CRS (`EPSG:3857`)
+  instead of nearest-neighbour on raw lat/lon -- this fixes blockiness and
+  the east-west stretch you'd otherwise get from treating geographic pixels
+  as square. Each thumbnail's label starts as the plain month name and is
+  replaced with the scene's real capture date (`d MMM yyyy`) once a single
+  batched Earth Engine round-trip resolves for all 12 months. A matching
   "open full size" link loads asynchronously below each thumbnail via
   `getThumbURL` and can take a few seconds to appear. Those full-size links
   are time-limited Earth Engine thumbnail URLs -- they are not meant to be
@@ -134,6 +146,11 @@ Go-to-coordinates, click-to-inspect, NDVI/VH charts) works the same as v2.
   Months with no usable Sentinel-2 pixels (cloud-obscured or no coverage)
   show a blank/black thumbnail rather than silently omitting the month --
   the calendar is honest about what has and hasn't got imagery.
+  **Resolution ceiling**: Sentinel-2 is native 10 m, so these changes fix
+  blockiness, framing, and lat/lon distortion, but cannot manufacture detail
+  finer than a 10 m pixel -- there is no free sub-10 m imagery source over
+  India in the GEE catalog, and Planet NICFI's free tropical-basemap access
+  (which was sub-5 m) has ended and is not reachable on this account.
 
 ### How to run v3
 

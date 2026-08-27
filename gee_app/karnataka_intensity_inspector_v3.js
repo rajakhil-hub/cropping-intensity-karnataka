@@ -96,10 +96,33 @@ var YEAR_CONFIGS = [
 var currentYearCfg = YEAR_CONFIGS[0];
 var lastClickedPoint = null; // {lon, lat}
 var INTENSITY_LAYER_NAME = 'Cropping Intensity 2024-25 (Raichur, validated)';
-var PHOTO_BOX_HALF_SIDE_M = 150;
-var PHOTO_THUMB_DIMENSIONS = '100x100';
-var PHOTO_FULL_DIMENSIONS = 512;
+// Photo-strip rendering params (display only -- the NDVI/VH extraction path
+// never touches these). Measured cause of the original blockiness: S2 is
+// native 10 m, so the old 300 m box (150 m half-side) was only ~30x30 real
+// pixels, nearest-neighbour-upsampled to 512 px. Fixes: a tighter box
+// (closer framing on the field), bigger renders + bicubic resample (softens
+// the upsampling blockiness instead of showing hard 10 m squares), and a
+// projected CRS (plain lat/lon pixels stretch east-west away from the
+// equator, so the box would otherwise render as a non-square rectangle).
+var PHOTO_BOX_HALF_SIDE_M = 100; // 200 m box (was 300 m) -- tighter frame on the clicked field
+var PHOTO_THUMB_DIMENSIONS = 256; // bare number = longest-side px, keeps the box square (was '100x100')
+var PHOTO_FULL_DIMENSIONS = 768; // was 512
+var PHOTO_CRS = 'EPSG:3857'; // projected (metres) so the box renders square, not lat-stretched
+var PHOTO_CLEAR_THRESHOLD = 0.5; // min mean CloudScore+ (cs_cdf) over the box to trust one scene over a month median
+var PHOTO_RESAMPLE = 'bicubic'; // smooths nearest-neighbour blockiness when upsampling 10 m pixels to the render size
+// Fallback stretch, used only when the adaptive one below cannot be measured
+// (e.g. the whole box is cloud-masked all year).
 var PHOTO_VIS = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000, gamma: 1.2};
+// Adaptive contrast stretch. Measured over real Raichur fields, surface
+// reflectance in a cropland box spans roughly 275-890, so the fixed 0-3000
+// stretch above used under a fifth of the available range and rendered every
+// month as dark mush -- contrast, not resolution, was the dominant cause of
+// the "blurry" look. Percentiles are taken ONCE over the whole agri-year (not
+// per month) so the twelve frames stay comparable to each other: a per-month
+// stretch would make a bare fallow field look as vivid as a standing crop and
+// destroy the very seasonal story the strip exists to show.
+var PHOTO_STRETCH_PCT = [2, 98];
+var PHOTO_STRETCH_GAMMA = 1.0; // the 1.2 above was compensating for the bad range
 var MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 var S2_COLLECTION_ID = 'COPERNICUS/S2_SR_HARMONIZED';
@@ -505,8 +528,11 @@ function buildNdviExtractionImage(regionGeom, yearCfg) {
 
 // ----------------------------------------------------------------------
 // MONTHLY FIELD PHOTOS
-// 12 true-color Sentinel-2 composites, one per calendar month of the
-// selected agri-year, for a small photo strip in the results panel.
+// One true-color Sentinel-2 frame per calendar month of the selected
+// agri-year, for a small photo strip in the results panel: the clearest
+// single scene over the photo box when one is clear enough (sharper than a
+// median -- no cross-date blending), falling back to a same-month median
+// composite when no single scene clears PHOTO_CLEAR_THRESHOLD.
 // ----------------------------------------------------------------------
 function monthWindows(yearCfg) {
   var start = new Date(yearCfg.agriStart + 'T00:00:00Z');
@@ -520,16 +546,60 @@ function monthWindows(yearCfg) {
   return months;
 }
 
+// Ranks a month's cloud-masked S2 images by mean CloudScore+ clarity over the
+// photo box, clearest first. img.get('cs') (the CloudScore+ image attached by
+// the join in buildS2MaskedCollection) survives that function's updateMask()
+// call -- verified empirically against live S2/CloudScore+ data, see
+// gee_app/README.md -- so it can still be read here even though monthColl is
+// already mask-applied.
+function monthlyBestImage(monthColl, regionGeom) {
+  return monthColl.map(function(img) {
+    img = ee.Image(img);
+    var clear = ee.Image(img.get('cs')).select(CLOUDSCORE_BAND).reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: regionGeom,
+      scale: SCALE_M
+    }).get(CLOUDSCORE_BAND);
+    return img.set('fieldClear', clear);
+  }).filter(ee.Filter.notNull(['fieldClear'])).sort('fieldClear', false);
+}
+
 function buildMonthlyPhotoImages(regionGeom, yearCfg) {
   var s2Masked = buildS2MaskedCollection(regionGeom, yearCfg);
   return monthWindows(yearCfg).map(function(m) {
     var monthColl = s2Masked.filterDate(m.start, m.end);
+    var ranked = monthlyBestImage(monthColl, regionGeom);
+    var rankedNonEmpty = ranked.size().gt(0);
+
+    // ranked.first() throws on an empty collection; ee.Algorithms.If only
+    // evaluates the branch it selects, so gating bestClear on rankedNonEmpty
+    // keeps first() from ever actually running when nothing in the month had
+    // a readable clarity value.
+    var bestClear = ee.Number(ee.Algorithms.If(
+      rankedNonEmpty, ee.Image(ranked.first()).get('fieldClear'), -1
+    ));
+    var useSingle = bestClear.gte(PHOTO_CLEAR_THRESHOLD);
+
+    var displayImage = ee.Image(ee.Algorithms.If(
+      useSingle,
+      ee.Image(ranked.first()).select(PHOTO_VIS.bands),
+      monthColl.median().select(PHOTO_VIS.bands)
+    )).resample(PHOTO_RESAMPLE); // display only -- never applied on the NDVI/VH path
+
     var composite = ee.Image(ee.Algorithms.If(
       monthColl.size().gt(0),
-      monthColl.median().select(PHOTO_VIS.bands),
+      displayImage,
       ee.Image.constant([0, 0, 0]).rename(PHOTO_VIS.bands).selfMask()
     ));
-    return {label: m.label, start: m.start, end: m.end, image: composite};
+
+    var dateStr = ee.String(ee.Algorithms.If(
+      useSingle,
+      ee.Date(ee.Image(ranked.first()).get('system:time_start')).format('d MMM yyyy'),
+      m.label
+    ));
+    var isSingle = ee.Number(ee.Algorithms.If(useSingle, 1, 0));
+
+    return {label: m.label, start: m.start, end: m.end, image: composite, dateStr: dateStr, isSingle: isSingle};
   });
 }
 
@@ -713,8 +783,9 @@ function addCharts(ndviComposites, vhComposites, point, yearCfg) {
 
 // Builds the 12-monthly photo strip for the currently inspected point.
 // myRequestId is the caller's inspection generation -- the async
-// getThumbURL callbacks below must stale-guard against it, since a later
-// click/year-change can fire before an earlier photo's URL comes back.
+// getThumbURL callbacks and the batched capture-date evaluate below must
+// stale-guard against it, since a later click/year-change can fire before
+// an earlier photo's URLs or dates come back.
 function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
   photoStripPanel.clear();
   photoStripPanel.add(ui.Label({
@@ -722,72 +793,158 @@ function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
     style: {fontWeight: 'bold', margin: '4px 0 4px 0'}
   }));
 
-  var gridPanel = ui.Panel({
-    layout: ui.Panel.Layout.Flow('horizontal', true),
-    style: {margin: '0'}
+  var loadingLabel = ui.Label({
+    value: 'Loading field photos...',
+    style: {fontSize: '11px', color: '#888888', margin: '2px 0'}
   });
-  photoStripPanel.add(gridPanel);
+  photoStripPanel.add(loadingLabel);
 
   var photos = buildMonthlyPhotoImages(regionGeom, yearCfg);
-  photos.forEach(function(p) {
-    var thumb = ui.Thumbnail({
-      image: p.image,
-      params: {
+
+  // ONE round trip for everything the cells need before they can be drawn:
+  // each month's real capture date + single/composite flag, plus the agri-year
+  // contrast stretch. The stretch has to come back before the thumbnails are
+  // built, because getThumbURL/ui.Thumbnail need client-side min/max numbers --
+  // so the cells are constructed inside this callback rather than above it.
+  var yearMedian = buildS2MaskedCollection(regionGeom, yearCfg)
+    .select(PHOTO_VIS.bands)
+    .median();
+  var batched = ee.Dictionary({
+    months: ee.List(photos.map(function(p) {
+      return ee.Dictionary({date: p.dateStr, single: p.isSingle});
+    })),
+    stretch: yearMedian.reduceRegion({
+      reducer: ee.Reducer.percentile(PHOTO_STRETCH_PCT),
+      geometry: regionGeom,
+      scale: SCALE_M,
+      maxPixels: 1e7
+    })
+  });
+
+  batched.evaluate(function(result, err) {
+    if (myRequestId !== activeRequestId) return;
+
+    photoStripPanel.remove(loadingLabel);
+    if (err || !result) {
+      photoStripPanel.add(ui.Label({
+        value: 'Could not load field photos.',
+        style: {fontSize: '11px', color: '#cc0000', margin: '2px 0'}
+      }));
+      return;
+    }
+
+    var vis = resolvePhotoStretch(result.stretch);
+
+    var gridPanel = ui.Panel({
+      layout: ui.Panel.Layout.Flow('horizontal', true),
+      style: {margin: '0'}
+    });
+    photoStripPanel.add(gridPanel);
+
+    var months = result.months || [];
+
+    photos.forEach(function(p, idx) {
+      var entry = months[idx] || {};
+      var labelText = entry.date || p.label;
+      if (!entry.single) labelText = labelText + ' (composite)';
+
+      var thumb = ui.Thumbnail({
+        image: p.image,
+        params: {
+          region: regionGeom,
+          dimensions: PHOTO_THUMB_DIMENSIONS,
+          crs: PHOTO_CRS,
+          format: 'png',
+          bands: vis.bands,
+          min: vis.min,
+          max: vis.max,
+          gamma: vis.gamma
+        },
+        style: {width: '100px', height: '100px', margin: '2px'}
+      });
+      var monthLabel = ui.Label({
+        value: labelText,
+        style: {
+          fontSize: '10px',
+          margin: '0 2px',
+          textAlign: 'center',
+          stretch: 'horizontal',
+          color: entry.single ? '#000000' : '#888888'
+        }
+      });
+      var linkLabel = ui.Label({
+        value: 'loading link...',
+        style: {fontSize: '9px', color: '#888888', margin: '0 2px'}
+      });
+
+      var cell = ui.Panel({
+        widgets: [thumb, monthLabel, linkLabel],
+        layout: ui.Panel.Layout.Flow('vertical'),
+        style: {width: '108px', backgroundColor: '#f4f4f4', margin: '2px'}
+      });
+      gridPanel.add(cell);
+
+      p.image.getThumbURL({
         region: regionGeom,
-        dimensions: PHOTO_THUMB_DIMENSIONS,
+        dimensions: PHOTO_FULL_DIMENSIONS,
+        crs: PHOTO_CRS,
         format: 'png',
-        bands: PHOTO_VIS.bands,
-        min: PHOTO_VIS.min,
-        max: PHOTO_VIS.max,
-        gamma: PHOTO_VIS.gamma
-      },
-      style: {width: '100px', height: '100px', margin: '2px'}
-    });
-    var monthLabel = ui.Label({
-      value: p.label,
-      style: {fontSize: '10px', margin: '0 2px', textAlign: 'center', stretch: 'horizontal'}
-    });
-    var linkLabel = ui.Label({
-      value: 'loading link...',
-      style: {fontSize: '9px', color: '#888888', margin: '0 2px'}
-    });
-
-    var cell = ui.Panel({
-      widgets: [thumb, monthLabel, linkLabel],
-      layout: ui.Panel.Layout.Flow('vertical'),
-      style: {width: '108px', backgroundColor: '#f4f4f4', margin: '2px'}
-    });
-    gridPanel.add(cell);
-
-    p.image.getThumbURL({
-      region: regionGeom,
-      dimensions: PHOTO_FULL_DIMENSIONS,
-      format: 'png',
-      bands: PHOTO_VIS.bands,
-      min: PHOTO_VIS.min,
-      max: PHOTO_VIS.max,
-      gamma: PHOTO_VIS.gamma
-    }, function(url, err) {
-      if (myRequestId !== activeRequestId) return;
-      if (err || !url) {
-        linkLabel.setValue('link failed');
-        return;
-      }
-      if (typeof linkLabel.setUrl === 'function') {
-        linkLabel.setValue('open full size');
-        linkLabel.style().set('color', '#1a73e8');
-        linkLabel.setUrl(url);
-      } else {
-        var newLabel = ui.Label({
-          value: 'open full size',
-          targetUrl: url,
-          style: {fontSize: '9px', color: '#1a73e8', margin: '0 2px'}
-        });
-        cell.remove(linkLabel);
-        cell.add(newLabel);
-      }
+        bands: vis.bands,
+        min: vis.min,
+        max: vis.max,
+        gamma: vis.gamma
+      }, function(url, thumbErr) {
+        if (myRequestId !== activeRequestId) return;
+        if (thumbErr || !url) {
+          linkLabel.setValue('link failed');
+          return;
+        }
+        if (typeof linkLabel.setUrl === 'function') {
+          linkLabel.setValue('open full size');
+          linkLabel.style().set('color', '#1a73e8');
+          linkLabel.setUrl(url);
+        } else {
+          var newLabel = ui.Label({
+            value: 'open full size',
+            targetUrl: url,
+            style: {fontSize: '9px', color: '#1a73e8', margin: '0 2px'}
+          });
+          cell.remove(linkLabel);
+          cell.add(newLabel);
+        }
+      });
     });
   });
+}
+
+// Turns the percentile dictionary from reduceRegion into visualization params.
+// Keys come back as '<band>_p<pct>' (e.g. B4_p2 / B4_p98). Falls back to the
+// fixed PHOTO_VIS stretch if any value is missing or the range is degenerate,
+// so a fully-masked box still renders something rather than failing.
+function resolvePhotoStretch(stretch) {
+  var loPct = PHOTO_STRETCH_PCT[0];
+  var hiPct = PHOTO_STRETCH_PCT[1];
+  var lo = null;
+  var hi = null;
+
+  if (stretch) {
+    for (var i = 0; i < PHOTO_VIS.bands.length; i++) {
+      var band = PHOTO_VIS.bands[i];
+      var bandLo = stretch[band + '_p' + loPct];
+      var bandHi = stretch[band + '_p' + hiPct];
+      if (typeof bandLo !== 'number' || typeof bandHi !== 'number') {
+        lo = null;
+        break;
+      }
+      lo = (lo === null || bandLo < lo) ? bandLo : lo;
+      hi = (hi === null || bandHi > hi) ? bandHi : hi;
+    }
+  }
+
+  if (lo === null || hi === null || !(hi > lo)) {
+    return PHOTO_VIS;
+  }
+  return {bands: PHOTO_VIS.bands, min: lo, max: hi, gamma: PHOTO_STRETCH_GAMMA};
 }
 
 // ----------------------------------------------------------------------
