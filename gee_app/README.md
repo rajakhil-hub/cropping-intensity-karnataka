@@ -133,7 +133,8 @@ Go-to-coordinates, click-to-inspect, NDVI/VH charts) works the same as v2.
   no scene is clear enough, fall back to a same-month median composite and
   are marked **"(composite)"** in grey under the thumbnail. Thumbnails render
   at 256 px (longest side) and full-size links at 768 px (both up from
-  100x100/512), using bicubic resampling and a projected CRS (`EPSG:3857`)
+  100x100/512) at an integer multiple of the native pixel grid, with NO
+  resampling (nearest-neighbour) and a projected CRS (`EPSG:3857`)
   instead of nearest-neighbour on raw lat/lon -- this fixes blockiness and
   the east-west stretch you'd otherwise get from treating geographic pixels
   as square. Each thumbnail's label starts as the plain month name and is

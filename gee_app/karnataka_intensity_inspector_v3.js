@@ -105,11 +105,21 @@ var INTENSITY_LAYER_NAME = 'Cropping Intensity 2024-25 (Raichur, validated)';
 // projected CRS (plain lat/lon pixels stretch east-west away from the
 // equator, so the box would otherwise render as a non-square rectangle).
 var PHOTO_BOX_HALF_SIDE_M = 100; // 200 m box (was 300 m) -- tighter frame on the clicked field
-var PHOTO_THUMB_DIMENSIONS = 256; // bare number = longest-side px, keeps the box square (was '100x100')
-var PHOTO_FULL_DIMENSIONS = 768; // was 512
+// A 200 m box at Sentinel-2's native 10 m holds exactly 20x20 real measurements.
+// Render at an INTEGER multiple of that (20*12=240, 20*32=640) so every native
+// pixel becomes a uniform square block -- a non-integer factor makes some pixels
+// wider than others, which reads as smearing.
+var PHOTO_THUMB_DIMENSIONS = 240;
+var PHOTO_FULL_DIMENSIONS = 640;
 var PHOTO_CRS = 'EPSG:3857'; // projected (metres) so the box renders square, not lat-stretched
 var PHOTO_CLEAR_THRESHOLD = 0.5; // min mean CloudScore+ (cs_cdf) over the box to trust one scene over a month median
-var PHOTO_RESAMPLE = 'bicubic'; // smooths nearest-neighbour blockiness when upsampling 10 m pixels to the render size
+// Deliberately NO resampling (Earth Engine's default nearest-neighbour).
+// Tested side by side on a Raichur field: bicubic interpolation smeared the
+// frames into mush, while nearest-neighbour kept crisp parcel edges and read as
+// far sharper. Interpolation cannot add detail to a 10 m pixel -- it only blurs
+// the detail that is there, so showing the real pixels as hard squares is both
+// the sharpest-looking and the most honest rendering.
+var PHOTO_RESAMPLE = null;
 // Fallback stretch, used only when the adaptive one below cannot be measured
 // (e.g. the whole box is cloud-masked all year).
 var PHOTO_VIS = {bands: ['B4', 'B3', 'B2'], min: 0, max: 3000, gamma: 1.2};
@@ -619,7 +629,11 @@ function buildMonthlyPhotoImages(regionGeom, yearCfg) {
       useSingle,
       ee.Image(ranked.first()).select(PHOTO_VIS.bands),
       monthColl.median().select(PHOTO_VIS.bands)
-    )).resample(PHOTO_RESAMPLE); // display only -- never applied on the NDVI/VH path
+    ));
+    // PHOTO_RESAMPLE is null by default (nearest-neighbour); honoured only if
+    // someone deliberately sets it. Display path only -- never the NDVI/VH path,
+    // where resampling would change reduction results.
+    if (PHOTO_RESAMPLE) displayImage = displayImage.resample(PHOTO_RESAMPLE);
 
     var composite = ee.Image(ee.Algorithms.If(
       monthColl.size().gt(0),
