@@ -107,12 +107,14 @@ var INTENSITY_LAYER_NAME = 'Cropping Intensity 2024-25 (Raichur, validated)';
 // FRAME WIDTH IS THE DOMINANT CONTROL ON APPARENT SHARPNESS, and it works the
 // opposite way to intuition. Sentinel-2 measures the ground in fixed 10 m
 // squares, so a narrow frame does not magnify detail -- it just contains fewer
-// real measurements and blows each one up further. Measured on a Raichur field
-// rendered at 480 px:
-//     200 m frame  ->  20x20 real pixels  -> 24x magnification (unreadable mush)
-//     600 m frame  ->  60x60 real pixels  ->  8x magnification (canal, road,
-//                                             field parcels all legible)
-//    1000 m frame  -> 100x100 real pixels ->  4.8x (reads like an aerial photo)
+// real measurements and blows each one up further. Measured on a Raichur field:
+// the real measurements inside each frame, and how far each one has to be blown
+// up to reach the ~240 px display size:
+//     400 m frame  ->  40x40 real pixels  -> 6x magnification (blocky, close in)
+//     600 m frame  ->  60x60 real pixels  -> 4x (canal, road and field parcels
+//                                            all legible -- the default)
+//    1000 m frame  -> 100x100 real pixels -> 2x (near-native; reads like an
+//                                            aerial photo, field is smaller)
 // An earlier version tightened this to 200 m to make the field fill the frame,
 // which was exactly backwards and was the main reason the strip looked blurry.
 // 600 m is the default: wide enough to look like imagery, tight enough that the
@@ -124,12 +126,28 @@ var PHOTO_FRAME_CHOICES = [
   {label: 'Standard (600 m)', halfSide: 300},
   {label: 'Wide (1 km)', halfSide: 500}
 ];
-// Render sizes are recomputed per frame width so they stay an INTEGER multiple
-// of the native pixel grid (600 m / 10 m = 60 px -> 240 = 4x, 600 = 10x); a
-// fractional factor makes some pixels wider than others, which itself smears.
-var PHOTO_THUMB_MULTIPLE = 4;
-var PHOTO_FULL_MULTIPLE = 10;
-var PHOTO_CRS = 'EPSG:3857'; // projected (metres) so the box renders square, not lat-stretched
+// On-screen size of one monthly frame. This is the setting that actually
+// governs how sharp the strip looks, and getting it wrong was the real bug:
+// the frames used to be RENDERED at 240 px and then DISPLAYED in a 100 px box,
+// so the browser bilinearly downscaled them by 2.4x and threw away five sixths
+// of the pixels. Crisp nearest-neighbour squares went in and smeared mush came
+// out -- that browser downscale, not the satellite, was the blur.
+// Now the render size and the display size are the same number, so one rendered
+// pixel lands on exactly one screen pixel and the browser rescales nothing.
+// The number is snapped to an integer multiple of the native 10 m grid (600 m
+// frame = 60 native px -> 4x = 240 px); a fractional factor would make some
+// pixels wider than others, which smears in its own right.
+var PHOTO_DISPLAY_TARGET_PX = 240;
+var PHOTO_FULL_MULTIPLE = 10; // "open full size" link: 10x native
+// Render in the frame's own UTM zone -- which is the projection Sentinel-2 is
+// natively gridded in -- rather than Web Mercator. At Raichur's latitude
+// Mercator metres are inflated by 1/cos(15.7 deg) = 1.039, so a 3857 render
+// resamples every pixel off a mismatched grid and duplicates them unevenly
+// (some real pixels drawn 4 screen px wide, their neighbours 5). In native UTM
+// the grids line up exactly and each satellite pixel is drawn identically.
+function photoCrsForLon(lon) {
+  return 'EPSG:' + (32600 + (Math.floor((lon + 180) / 6) + 1)); // northern hemisphere
+}
 var PHOTO_CLEAR_THRESHOLD = 0.5; // min mean CloudScore+ (cs_cdf) over the box to trust one scene over a month median
 // Deliberately NO resampling (Earth Engine's default nearest-neighbour).
 // Tested side by side on a Raichur field: bicubic interpolation smeared the
@@ -1092,7 +1110,9 @@ function addCharts(ndviComposites, vhComposites, point, yearCfg, myRequestId, re
 // getThumbURL callbacks and the batched capture-date evaluate below must
 // stale-guard against it, since a later click/year-change can fire before
 // an earlier photo's URLs or dates come back.
-function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
+function buildPhotoStrip(regionGeom, yearCfg, myRequestId, lon) {
+  var photoCrs = photoCrsForLon(lon);
+  var frameDim = photoThumbDimensions(currentPhotoHalfSide);
   photoStripPanel.clear();
   photoStripPanel.add(ui.Label({
     value: 'Field photos (Jun-May)',
@@ -1158,15 +1178,16 @@ function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
         image: p.image,
         params: {
           region: regionGeom,
-          dimensions: photoThumbDimensions(currentPhotoHalfSide),
-          crs: PHOTO_CRS,
+          dimensions: frameDim,
+          crs: photoCrs,
           format: 'png',
           bands: vis.bands,
           min: vis.min,
           max: vis.max,
           gamma: vis.gamma
         },
-        style: {width: '100px', height: '100px', margin: '2px'}
+        // Display size == render size: no browser rescaling, no smearing.
+        style: {width: frameDim + 'px', height: frameDim + 'px', margin: '2px'}
       });
       var monthLabel = ui.Label({
         value: labelText,
@@ -1186,14 +1207,14 @@ function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
       var cell = ui.Panel({
         widgets: [thumb, monthLabel, linkLabel],
         layout: ui.Panel.Layout.Flow('vertical'),
-        style: {width: '108px', backgroundColor: '#f4f4f4', margin: '2px'}
+        style: {width: (frameDim + 8) + 'px', backgroundColor: '#f4f4f4', margin: '2px'}
       });
       gridPanel.add(cell);
 
       p.image.getThumbURL({
         region: regionGeom,
         dimensions: photoFullDimensions(currentPhotoHalfSide),
-        crs: PHOTO_CRS,
+        crs: photoCrs,
         format: 'png',
         bands: vis.bands,
         min: vis.min,
@@ -1258,8 +1279,12 @@ function resolvePhotoStretch(stretch) {
 function photoNativePx(halfSideM) {
   return Math.round((halfSideM * 2) / SCALE_M);
 }
+// Rendered AND displayed size of a strip frame: the integer multiple of the
+// native grid that sits closest to PHOTO_DISPLAY_TARGET_PX.
 function photoThumbDimensions(halfSideM) {
-  return photoNativePx(halfSideM) * PHOTO_THUMB_MULTIPLE;
+  var native = photoNativePx(halfSideM);
+  var multiple = Math.max(1, Math.round(PHOTO_DISPLAY_TARGET_PX / native));
+  return native * multiple;
 }
 function photoFullDimensions(halfSideM) {
   return photoNativePx(halfSideM) * PHOTO_FULL_MULTIPLE;
@@ -1324,7 +1349,7 @@ function inspectPoint(lon, lat) {
     var ndviComposites = buildNdviComposites(regionGeom, yearCfg);
     var vhComposites = buildVhComposites(regionGeom, yearCfg);
 
-    buildPhotoStrip(photoRegion, yearCfg, myRequestId);
+    buildPhotoStrip(photoRegion, yearCfg, myRequestId, lon);
 
     var useValidated = flags.inRaichur && yearCfg.validatedAssetEligible && validatedAssetAvailable;
     if (useValidated) {
@@ -2064,7 +2089,10 @@ clearAreaResults();
 var sidePanel = ui.Panel({
   widgets: [headerPanel, areaPanel, resultsPanel],
   layout: ui.Panel.Layout.Flow('vertical'),
-  style: {width: '350px'}
+  // Wide enough to show two 240 px monthly frames side by side. A narrower
+  // panel is what forced the frames down to 100 px thumbnails in the first
+  // place; the strip is a main deliverable, so it gets the room.
+  style: {width: '530px'}
 });
 
 // Attach the side panel directly to ui.root instead of reparenting the
