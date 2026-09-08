@@ -147,6 +147,16 @@ Go-to-coordinates, click-to-inspect, NDVI/VH charts) works the same as v2.
   Months with no usable Sentinel-2 pixels (cloud-obscured or no coverage)
   show a blank/black thumbnail rather than silently omitting the month --
   the calendar is honest about what has and hasn't got imagery.
+  **Frame width is the dominant control on apparent sharpness**, and it works
+  the opposite way to intuition: Sentinel-2 measures the ground in fixed 10 m
+  squares, so a narrower frame does not magnify detail, it just contains fewer
+  real measurements and blows each one up further. Measured at 480 px on a
+  Raichur field -- a 200 m frame is 20x20 real pixels (24x magnification,
+  unreadable); 600 m is 60x60 (8x, canal/road/parcels legible); 1 km is 100x100
+  (4.8x, reads like an aerial photo). The default is **600 m**, and a
+  **"Photo frame width"** dropdown offers Close (400 m) / Standard (600 m) /
+  Wide (1 km). Render sizes are derived from the frame so every option stays an
+  exact integer multiple of the native pixel grid (always 10x for full size).
   **Resolution ceiling**: Sentinel-2 is native 10 m, so these changes fix
   blockiness, framing, and lat/lon distortion, but cannot manufacture detail
   finer than a 10 m pixel -- there is no free sub-10 m imagery source over

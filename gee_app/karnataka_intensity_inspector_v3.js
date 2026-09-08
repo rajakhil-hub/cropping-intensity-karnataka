@@ -104,13 +104,31 @@ var INTENSITY_LAYER_NAME = 'Cropping Intensity 2024-25 (Raichur, validated)';
 // the upsampling blockiness instead of showing hard 10 m squares), and a
 // projected CRS (plain lat/lon pixels stretch east-west away from the
 // equator, so the box would otherwise render as a non-square rectangle).
-var PHOTO_BOX_HALF_SIDE_M = 100; // 200 m box (was 300 m) -- tighter frame on the clicked field
-// A 200 m box at Sentinel-2's native 10 m holds exactly 20x20 real measurements.
-// Render at an INTEGER multiple of that (20*12=240, 20*32=640) so every native
-// pixel becomes a uniform square block -- a non-integer factor makes some pixels
-// wider than others, which reads as smearing.
-var PHOTO_THUMB_DIMENSIONS = 240;
-var PHOTO_FULL_DIMENSIONS = 640;
+// FRAME WIDTH IS THE DOMINANT CONTROL ON APPARENT SHARPNESS, and it works the
+// opposite way to intuition. Sentinel-2 measures the ground in fixed 10 m
+// squares, so a narrow frame does not magnify detail -- it just contains fewer
+// real measurements and blows each one up further. Measured on a Raichur field
+// rendered at 480 px:
+//     200 m frame  ->  20x20 real pixels  -> 24x magnification (unreadable mush)
+//     600 m frame  ->  60x60 real pixels  ->  8x magnification (canal, road,
+//                                             field parcels all legible)
+//    1000 m frame  -> 100x100 real pixels ->  4.8x (reads like an aerial photo)
+// An earlier version tightened this to 200 m to make the field fill the frame,
+// which was exactly backwards and was the main reason the strip looked blurry.
+// 600 m is the default: wide enough to look like imagery, tight enough that the
+// clicked field still dominates. The viewer can change it (PHOTO_FRAME_CHOICES).
+var PHOTO_BOX_HALF_SIDE_M = 300; // 600 m frame (default; mutable via the frame control)
+var currentPhotoHalfSide = 300;
+var PHOTO_FRAME_CHOICES = [
+  {label: 'Close (400 m)', halfSide: 200},
+  {label: 'Standard (600 m)', halfSide: 300},
+  {label: 'Wide (1 km)', halfSide: 500}
+];
+// Render sizes are recomputed per frame width so they stay an INTEGER multiple
+// of the native pixel grid (600 m / 10 m = 60 px -> 240 = 4x, 600 = 10x); a
+// fractional factor makes some pixels wider than others, which itself smears.
+var PHOTO_THUMB_MULTIPLE = 4;
+var PHOTO_FULL_MULTIPLE = 10;
 var PHOTO_CRS = 'EPSG:3857'; // projected (metres) so the box renders square, not lat-stretched
 var PHOTO_CLEAR_THRESHOLD = 0.5; // min mean CloudScore+ (cs_cdf) over the box to trust one scene over a month median
 // Deliberately NO resampling (Earth Engine's default nearest-neighbour).
@@ -1140,7 +1158,7 @@ function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
         image: p.image,
         params: {
           region: regionGeom,
-          dimensions: PHOTO_THUMB_DIMENSIONS,
+          dimensions: photoThumbDimensions(currentPhotoHalfSide),
           crs: PHOTO_CRS,
           format: 'png',
           bands: vis.bands,
@@ -1174,7 +1192,7 @@ function buildPhotoStrip(regionGeom, yearCfg, myRequestId) {
 
       p.image.getThumbURL({
         region: regionGeom,
-        dimensions: PHOTO_FULL_DIMENSIONS,
+        dimensions: photoFullDimensions(currentPhotoHalfSide),
         crs: PHOTO_CRS,
         format: 'png',
         bands: vis.bands,
@@ -1235,6 +1253,18 @@ function resolvePhotoStretch(stretch) {
   return {bands: PHOTO_VIS.bands, min: lo, max: hi, gamma: PHOTO_STRETCH_GAMMA};
 }
 
+// Native pixel count across the current frame, and render sizes locked to an
+// integer multiple of it.
+function photoNativePx(halfSideM) {
+  return Math.round((halfSideM * 2) / SCALE_M);
+}
+function photoThumbDimensions(halfSideM) {
+  return photoNativePx(halfSideM) * PHOTO_THUMB_MULTIPLE;
+}
+function photoFullDimensions(halfSideM) {
+  return photoNativePx(halfSideM) * PHOTO_FULL_MULTIPLE;
+}
+
 // ----------------------------------------------------------------------
 // INSPECTION
 // ----------------------------------------------------------------------
@@ -1249,7 +1279,7 @@ function inspectPoint(lon, lat) {
 
   var point = ee.Geometry.Point([lon, lat]);
   var regionGeom = point.buffer(BUFFER_RADIUS_M);
-  var photoRegion = point.buffer(PHOTO_BOX_HALF_SIDE_M).bounds();
+  var photoRegion = point.buffer(currentPhotoHalfSide).bounds();
 
   replaceMapLayer(CLICK_LAYER_NAME, point, {color: 'FF0000'});
 
@@ -1823,6 +1853,27 @@ function applyYearSelection(yearCfg) {
 // ----------------------------------------------------------------------
 var yearLabels = YEAR_CONFIGS.map(function(c) { return c.label; });
 
+// Frame width for the monthly photo strip. Wider frames contain more real
+// Sentinel-2 measurements and therefore look sharper -- see the measured
+// comparison at PHOTO_FRAME_CHOICES. Changing it re-inspects the current point
+// so the strip redraws at the new width.
+var photoFrameSelect = ui.Select({
+  items: PHOTO_FRAME_CHOICES.map(function(c) { return c.label; }),
+  value: PHOTO_FRAME_CHOICES[1].label,
+  onChange: function(label) {
+    for (var i = 0; i < PHOTO_FRAME_CHOICES.length; i++) {
+      if (PHOTO_FRAME_CHOICES[i].label === label) {
+        currentPhotoHalfSide = PHOTO_FRAME_CHOICES[i].halfSide;
+        if (lastClickedPoint) {
+          inspectPoint(lastClickedPoint.lon, lastClickedPoint.lat);
+        }
+        return;
+      }
+    }
+  },
+  style: {stretch: 'horizontal'}
+});
+
 var yearSelect = ui.Select({
   items: yearLabels,
   value: yearLabels[0],
@@ -1935,6 +1986,8 @@ var controlPanel = ui.Panel({
     ui.Label({value: 'Karnataka Cropping Inspector', style: {fontWeight: 'bold', fontSize: '15px', margin: '4px 4px 8px 4px'}}),
     ui.Label({value: 'Agricultural year', style: {margin: '0 4px 2px 4px'}}),
     yearSelect,
+    ui.Label({value: 'Photo frame width', style: {margin: '8px 4px 2px 4px'}}),
+    photoFrameSelect,
     ui.Label({value: 'State', style: {margin: '8px 4px 2px 4px'}}),
     stateSelect,
     ui.Label({value: 'District', style: {margin: '8px 4px 2px 4px'}}),
