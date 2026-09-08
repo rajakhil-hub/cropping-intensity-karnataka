@@ -231,5 +231,53 @@ it never delays the cropping-intensity answer.
   from a completely separate physical measurement.
 - MODIS ET is 463 m -- one pixel covers ~20 ha, so it **cannot resolve a single
   field**. It is labelled area-scale context in the UI and is deliberately never
-  shown in the per-field panel. Field-scale canopy signals (NDVI, and the
-  SL2P LAI in `src/cropint/gee/biophysical.py`) stay at 10 m.
+  shown in the per-field panel. Field-scale canopy signals (NDVI, SL2P LAI)
+  stay at 10 m.
+
+### SL2P LAI (field scale)
+
+v3 also computes per-pixel Sentinel-2 LAI (Leaf-Area Index) using ESA's SNAP S2
+Biophysical Processor (SL2P) neural network, available in both per-field and
+area-panel results.
+
+- **What SL2P LAI is**: the ESA SNAP biophysical processor (`gee_app/lib/sl2p_lai.js`,
+  ported from `src/cropint/gee/biophysical.py`) — a neural network that predicts
+  canopy leaf-area index directly from Sentinel-2 reflectances and scene-geometry
+  angles, at 10-20 m (depending on band).
+- **Why LAI instead of MODIS**: MODIS LAI is 463 m (one pixel ~20 ha), so it cannot
+  resolve a smallholder field. SL2P runs on the Sentinel-2 reflectances the app
+  already pulls (for NDVI/VH), giving field-scale LAI with no extra data fetch.
+- **Why LAI instead of just NDVI**: NDVI saturates in dense canopy, flattening
+  out at high biomass. On a Raichur double-crop paddy field (11 Mar / 26 Mar / 5 Apr
+  2025), NDVI stayed flat at 0.88/0.88/0.90 across all three dates, while SL2P LAI
+  resolved the declining canopy: 4.25 → 3.93 → 3.70. This extra sensitivity is what
+  cycle counting on paddy and sugarcane needs.
+- **Per-field LAI chart**: after NDVI and VH, the results panel adds a third chart
+  showing the year's SL2P LAI time series. It loads last (takes ~9 s for a 25-period
+  series vs ~2 s for NDVI/VH), so it never delays the faster charts; once ready, it
+  appends to the panel progressively.
+- **Rice/paddy caveat**: rice and paddy are **not** in SL2P's training crop set, so
+  while the curve shape is reliable for cycle counting, trust its form over the
+  absolute magnitude over paddy fields. The caveat appears inline in the chart title
+  and area-panel note.
+- **Area-panel peak LAI**: under the cropping-intensity and water-use summaries, the
+  draw-an-area results also show `Peak LAI (area mean)` — the year's maximum LAI
+  per pixel, then spatially averaged over the drawn area. This gives a quick sense
+  of peak canopy density.
+
+To verify JS/Python parity across 8 test cases (5 synthetic, 3 real anchors from
+live Raichur imagery):
+
+```bash
+.venv/bin/python scripts/generate_sl2p_fixtures.py
+node --test gee_app/test/count_cycles.test.js gee_app/test/sync_check.test.js gee_app/test/sl2p_lai.test.js
+```
+
+(The directory form `node --test gee_app/test/` breaks when the repo path contains
+a space -- always pass explicit file list.)
+
+The fixture includes real validation points: Sindhanur paddy computed 3.067
+(expected ~3.071), Lingsugur rainfed 0.152 (expected ~0.151), Jaladurga scrub
+0.251 (expected ~0.253). The test also covers `sync_check.test.js`, which verifies
+that the embedded SL2P code block in v3 stays byte-identical to the canonical
+library file (anti-drift gate, same as for `count_cycles`).

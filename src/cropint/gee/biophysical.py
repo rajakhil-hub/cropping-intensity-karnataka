@@ -35,6 +35,7 @@ https://step.esa.int/docs/extra/ATBD_S2ToolBox_L2B_V1.1.pdf
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import ee
 
@@ -154,6 +155,33 @@ def sl2p_lai(img: ee.Image, clamp: bool = True) -> ee.Image:
     # copyProperties returns an Element, not an Image — re-wrap so callers can
     # chain Image methods (reduceRegion, etc.) directly.
     return ee.Image(lai.copyProperties(img, ["system:time_start"]))
+
+
+def sl2p_lai_values(inputs: Sequence[float]) -> float:
+    """Pure-numeric SL2P LAI: mirrors `sl2p_lai()` exactly but on plain floats.
+
+    `inputs` is 11 values -- 8 reflectances (0-1, SL2P_BANDS order) followed
+    by 3 angle cosines (viewZen, sunZen, relAzim) -- same order as the JS
+    port. No `ee` calls, so it can run without a live Earth Engine session
+    (used by scripts/generate_sl2p_fixtures.py for parity-test fixtures).
+    """
+    normalized = [
+        (inputs[i] - _NORM[i][0]) / (_NORM[i][1] - _NORM[i][0]) * 2 - 1 for i in range(len(_NORM))
+    ]
+
+    hidden = []
+    for neuron in range(len(_LAYER1_BIAS)):
+        acc = _LAYER1_BIAS[neuron]
+        for i, norm_input in enumerate(normalized):
+            acc += norm_input * _LAYER1_WEIGHTS[neuron][i]
+        hidden.append(math.tanh(acc))
+
+    net = _LAYER2_BIAS
+    for neuron, activation in enumerate(hidden):
+        net += activation * _LAYER2_WEIGHTS[neuron]
+
+    lai = (net + 1) * (0.5 * (_DENORM[1] - _DENORM[0])) + _DENORM[0]
+    return min(max(lai, LAI_VALID_RANGE[0]), LAI_VALID_RANGE[1])
 
 
 def evi(img: ee.Image) -> ee.Image:
