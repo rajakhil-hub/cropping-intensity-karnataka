@@ -182,6 +182,19 @@ var SCALE_M = 10;
 // referenced only, not loaded/verified here.
 var CLASSIFIED_ASSET_ID = 'projects/my-project-13544-490022/assets/raichur_intensity_2024_25';
 
+// Field-boundary overlay: ALU parcel polygons for Narayanpur Right Bank Canal
+// Distributary 10 (northern Raichur), carrying the FIELD-scale class from
+// scripts/classify_fields.py rather than the per-pixel class. The two can
+// legitimately disagree -- a field mean averages away the sub-field variation
+// the pixel map shows -- and seeing both is the point of the overlay.
+// Entirely optional: if the asset is absent the probe leaves the control
+// disabled rather than surfacing a permanent layer error.
+var FIELDS_ASSET_ID = 'projects/my-project-13544-490022/assets/nrbc_d10_fields';
+var FIELDS_CENTER = {lon: 76.77394, lat: 16.31036, zoom: 14};
+var FIELDS_FILL_LAYER_NAME = 'NRBC D10 fields (field-scale class)';
+var FIELDS_EDGE_LAYER_NAME = 'NRBC D10 field boundaries';
+var FIELDS_FILL_OPACITY = 0.65;
+
 // Class legend: value -> {color, label}
 var CLASS_INFO = [
   {value: 0, color: '#d9c29a', label: 'Fallow / non-crop'},
@@ -1012,6 +1025,18 @@ var classifiedImage = classifiedRaw.updateMask(classifiedRaw.neq(255));
 // and the legend explains why. Uploading the asset later auto-upgrades the
 // app on its next load -- no code change needed.
 var validatedAssetAvailable = false;
+
+// paint() rasterises the parcel polygons: the fill carries class_id so it
+// reuses the same PALETTE as the pixel map, and a separate 1-pixel outline is
+// drawn on top so individual parcels stay readable where neighbours share a
+// class. Layer handles are captured at probe time so the checkbox can toggle
+// them without rebuilding.
+var fieldsFC = ee.FeatureCollection(FIELDS_ASSET_ID);
+var fieldsFill = ee.Image().byte().paint(fieldsFC, 'class_id');
+var fieldsEdge = ee.Image().byte().paint(fieldsFC, 1, 1);
+var fieldsAssetAvailable = false;
+var fieldsFillLayer = null;
+var fieldsEdgeLayer = null;
 
 // ----------------------------------------------------------------------
 // RESULTS PANEL HELPERS
@@ -2006,6 +2031,32 @@ var areaButtonRow = ui.Panel({
   layout: ui.Panel.Layout.Flow('horizontal')
 });
 
+// Field-boundary overlay controls. Both start disabled and are enabled by the
+// asset probe after startup (see below Map.add(controlPanel)).
+var fieldsCheckbox = ui.Checkbox({
+  label: 'Show field boundaries',
+  value: false,
+  disabled: true,
+  onChange: function(checked) {
+    if (fieldsFillLayer) fieldsFillLayer.setShown(checked);
+    if (fieldsEdgeLayer) fieldsEdgeLayer.setShown(checked);
+  }
+});
+
+var fieldsZoomButton = ui.Button({
+  label: 'Zoom to NRBC D10',
+  disabled: true,
+  onClick: function() {
+    Map.setCenter(FIELDS_CENTER.lon, FIELDS_CENTER.lat, FIELDS_CENTER.zoom);
+    if (!fieldsCheckbox.getValue()) fieldsCheckbox.setValue(true); // fires onChange
+  }
+});
+
+var fieldsNote = ui.Label({
+  value: 'Checking for field asset...',
+  style: {fontSize: '10px', color: '#888888', margin: '0 4px 2px 4px'}
+});
+
 var controlPanel = ui.Panel({
   widgets: [
     ui.Label({value: 'Karnataka Cropping Inspector', style: {fontWeight: 'bold', fontSize: '15px', margin: '4px 4px 8px 4px'}}),
@@ -2021,12 +2072,35 @@ var controlPanel = ui.Panel({
     goRow,
     goErrorLabel,
     ui.Label({value: 'Draw an area', style: {margin: '8px 4px 2px 4px'}}),
-    areaButtonRow
+    areaButtonRow,
+    ui.Label({value: 'Field boundaries', style: {margin: '8px 4px 2px 4px'}}),
+    fieldsCheckbox,
+    fieldsZoomButton,
+    fieldsNote
   ],
   layout: ui.Panel.Layout.Flow('vertical'),
   style: {position: 'top-left', width: '260px', padding: '8px'}
 });
 Map.add(controlPanel);
+
+// Probe the field asset the same way the validated raster is probed: an eager
+// addLayer on a missing asset leaves a permanent error on the map, so the
+// layers are only created once the collection is known to resolve. Uploading
+// the asset later upgrades the app on its next load with no code change.
+fieldsFC.size().evaluate(function(count, error) {
+  if (error || !count) {
+    fieldsNote.setValue('Field asset not uploaded yet - overlay unavailable.');
+    return;
+  }
+  fieldsAssetAvailable = true;
+  fieldsFillLayer = Map.addLayer(
+    fieldsFill, {min: 0, max: 4, palette: PALETTE}, FIELDS_FILL_LAYER_NAME, false, FIELDS_FILL_OPACITY);
+  fieldsEdgeLayer = Map.addLayer(
+    fieldsEdge, {palette: ['000000']}, FIELDS_EDGE_LAYER_NAME, false);
+  fieldsCheckbox.setDisabled(false);
+  fieldsZoomButton.setDisabled(false);
+  fieldsNote.setValue(count + ' fields - colours are the FIELD-scale class, which can differ from the pixel class.');
+});
 
 // ----------------------------------------------------------------------
 // RIGHT SIDE PANEL (title + instructions, never cleared; results, rebuilt
