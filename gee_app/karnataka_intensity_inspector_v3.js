@@ -95,6 +95,11 @@ var YEAR_CONFIGS = [
 ];
 var currentYearCfg = YEAR_CONFIGS[0];
 var lastClickedPoint = null; // {lon, lat}
+// Pixel vs Plot analysis mode -- see ANALYSIS_MODE_CHOICES / analysisModeSelect
+// below and inspectPoint()'s mode branch. 'pixel' is the original, unchanged
+// per-10m-pixel behavior; 'plot' reduces mean() over the matched field
+// boundary (FIELDS_ASSET_ID) instead of the clicked pixel.
+var currentAnalysisMode = 'pixel';
 var INTENSITY_LAYER_NAME = 'Cropping Intensity 2024-25 (Raichur, validated)';
 // Photo-strip rendering params (display only -- the NDVI/VH extraction path
 // never touches these). Measured cause of the original blockiness: S2 is
@@ -125,6 +130,13 @@ var PHOTO_FRAME_CHOICES = [
   {label: 'Close (400 m)', halfSide: 200},
   {label: 'Standard (600 m)', halfSide: 300},
   {label: 'Wide (1 km)', halfSide: 500}
+];
+// Pixel vs Plot analysis mode choices for analysisModeSelect (see CONTROL
+// PANEL below). 'plot' routes inspectPoint() through the matched-field path
+// (runPlotModeInspection) instead of the default per-pixel path.
+var ANALYSIS_MODE_CHOICES = [
+  {label: 'Pixel (10 m)', mode: 'pixel'},
+  {label: 'Plot / field boundary', mode: 'plot'}
 ];
 // On-screen size of one monthly frame. This is the setting that actually
 // governs how sharp the strip looks, and getting it wrong was the real bug:
@@ -194,6 +206,15 @@ var FIELDS_CENTER = {lon: 76.77394, lat: 16.31036, zoom: 14};
 var FIELDS_FILL_LAYER_NAME = 'NRBC D10 fields (field-scale class)';
 var FIELDS_EDGE_LAYER_NAME = 'NRBC D10 field boundaries';
 var FIELDS_FILL_OPACITY = 0.65;
+
+// Single-field outline layers: the matched field in Plot mode (feature 1) and
+// the hand-drawn polygon from "Draw field" (feature 2) each get their own
+// distinct layer name so repeat clicks/draws replace rather than stack (see
+// replaceMapLayer). Both share one outline color since both mean the same
+// thing to the viewer: "this polygon is the field being analysed".
+var PLOT_OUTLINE_LAYER_NAME = 'inspected field outline';
+var DRAWN_FIELD_LAYER_NAME = 'drawn field outline';
+var FIELD_OUTLINE_COLOR = '#1a73e8';
 
 // Class legend: value -> {color, label}
 var CLASS_INFO = [
@@ -285,6 +306,10 @@ var STATE_CONFIGS = [
 
 var SOURCE_VALIDATED = 'from validated map';
 var SOURCE_LIVE = 'computed live - same algorithm as validated map';
+// Tags the precomputed class_id carried by a FIELDS_ASSET_ID field (from
+// scripts/classify_fields.py) so it is never confused with a freshly
+// computed live/validated result shown alongside it (Plot mode, feature 1).
+var SOURCE_BATCH = 'batch result';
 
 // Build the "Class: ..." label text, tagging on whether the value came from
 // the validated Raichur asset or was computed live in-browser.
@@ -296,6 +321,56 @@ function formatClassLabel(classValue, sourceTag) {
     classText = CLASS_TEXT[String(classValue)] || NODATA_TEXT;
   }
   return classText + ' (' + sourceTag + ')';
+}
+
+// Exact wording is load-bearing (measured across the 14,457-field NRBC D10
+// asset) -- kept in ONE place so Plot-mode field matches (feature 1) and
+// "Draw field" (feature 2) render an identical caution instead of two
+// hand-typed copies drifting apart.
+var LOW_PIXEL_CAUTION_TEXT = 'Field is under 4 Sentinel-2 pixels — mixing with ' +
+  'neighbouring parcels damps the NDVI amplitude, and measured across 14,457 fields ' +
+  'this causes cycles to be under-counted. Treat this result as indicative only.';
+
+// Shared "field attributes" block -- area/pixel-count/reliability/batch-class
+// rows plus the <4-pixel caution -- used by both a Plot-mode asset match
+// (opts.reliab/opts.batchClassId present) and a hand-drawn "Draw field"
+// polygon (opts.reliab/opts.batchClassId omitted, area/pixel-count computed
+// client-side instead of read from the asset). Any opts field may be
+// null/omitted. Returns an array of ui.Label widgets for the caller to add
+// into whichever panel it is rendering into.
+function buildFieldAttributeWidgets(opts) {
+  var widgets = [];
+  if (typeof opts.areaHa === 'number') {
+    widgets.push(ui.Label({
+      value: 'Area: ' + opts.areaHa.toFixed(2) + ' ha',
+      style: {fontSize: '11px', margin: '1px 0'}
+    }));
+  }
+  if (typeof opts.nPx === 'number') {
+    widgets.push(ui.Label({
+      value: 'Estimated pixels: ' + opts.nPx.toFixed(1),
+      style: {fontSize: '11px', margin: '1px 0'}
+    }));
+  }
+  if (opts.reliab) {
+    widgets.push(ui.Label({
+      value: 'Reliability (' + SOURCE_BATCH + '): ' + opts.reliab,
+      style: {fontSize: '11px', margin: '1px 0'}
+    }));
+  }
+  if (opts.batchClassId !== undefined && opts.batchClassId !== null) {
+    widgets.push(ui.Label({
+      value: 'Class: ' + formatClassLabel(opts.batchClassId, SOURCE_BATCH),
+      style: {fontSize: '11px', margin: '1px 0'}
+    }));
+  }
+  if (typeof opts.nPx === 'number' && opts.nPx < 4) {
+    widgets.push(ui.Label({
+      value: LOW_PIXEL_CAUTION_TEXT,
+      style: {fontSize: '11px', color: '#cc0000', fontWeight: 'bold', margin: '4px 0 0 0'}
+    }));
+  }
+  return widgets;
 }
 
 // ----------------------------------------------------------------------
@@ -1328,10 +1403,14 @@ function inspectPoint(lon, lat) {
   lastClickedPoint = {lon: lon, lat: lat};
 
   var point = ee.Geometry.Point([lon, lat]);
-  var regionGeom = point.buffer(BUFFER_RADIUS_M);
   var photoRegion = point.buffer(currentPhotoHalfSide).bounds();
 
   replaceMapLayer(CLICK_LAYER_NAME, point, {color: 'FF0000'});
+  // A previous click may have left a matched-field outline on the map --
+  // clear it up front so a click that doesn't match a field (or a pixel-mode
+  // click) never leaves a stale one behind. Plot mode re-adds it below once a
+  // match is confirmed.
+  removeLayerByName(PLOT_OUTLINE_LAYER_NAME);
 
   var lonR = Math.round(lon * 10000) / 10000;
   var latR = Math.round(lat * 10000) / 10000;
@@ -1352,6 +1431,7 @@ function inspectPoint(lon, lat) {
   classLabel.style().set('color', '#888888');
   photoStripPanel.clear();
   chartsPanel.clear();
+  fieldContextPanel.clear();
 
   var boundaryCheck = ee.Dictionary({
     inKarnataka: currentState.level1.filterBounds(point).size(),
@@ -1371,18 +1451,104 @@ function inspectPoint(lon, lat) {
       return;
     }
 
-    var ndviComposites = buildNdviComposites(regionGeom, yearCfg);
-    var vhComposites = buildVhComposites(regionGeom, yearCfg);
-
-    buildPhotoStrip(photoRegion, yearCfg, myRequestId, lon);
-
-    var useValidated = flags.inRaichur && yearCfg.validatedAssetEligible && validatedAssetAvailable;
-    if (useValidated) {
-      inspectValidated(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId);
+    if (currentAnalysisMode === 'plot') {
+      runPlotModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId);
     } else {
-      inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId);
+      runPixelModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId);
     }
   });
+}
+
+// Default per-10m-pixel path -- unchanged in outcome from before Analysis
+// mode existed: same reducer (first()), same geometry (the clicked point),
+// same maxPixels (1e6). Also the fallback target when Plot mode can't find a
+// field (no boundary asset loaded, or the click misses every mapped field).
+function runPixelModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId) {
+  var regionGeom = point.buffer(BUFFER_RADIUS_M);
+  var ndviComposites = buildNdviComposites(regionGeom, yearCfg);
+  var vhComposites = buildVhComposites(regionGeom, yearCfg);
+
+  buildPhotoStrip(photoRegion, yearCfg, myRequestId, lon);
+
+  var useValidated = flags.inRaichur && yearCfg.validatedAssetEligible && validatedAssetAvailable;
+  if (useValidated) {
+    inspectValidated(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId);
+  } else {
+    inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId, ee.Reducer.first(), point, 1e6);
+  }
+}
+
+// Plot mode: look up the field containing the click (FIELDS_ASSET_ID) and, if
+// found, classify the field's MEAN NDVI instead of the single clicked pixel --
+// reusing inspectLive() with a different reducer/geometry (see its updated
+// signature below) rather than a duplicate code path. Falls back to the
+// ordinary pixel path, with a plain on-screen explanation, whenever there is
+// no usable field: asset not loaded (item 8) or the click misses every mapped
+// field (item 7). Never throws -- both fallbacks are handled data, not errors.
+function runPlotModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId) {
+  if (!fieldsAssetAvailable) {
+    fieldContextPanel.add(ui.Label({
+      value: 'Field boundary asset is not loaded -- showing pixel result instead.',
+      style: {fontSize: '11px', color: '#888888', margin: '0 0 4px 0'}
+    }));
+    runPixelModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId);
+    return;
+  }
+
+  var fieldMatches = fieldsFC.filterBounds(point);
+  // .first() throws on an empty collection (see buildMonthlyPhotoImages'
+  // rankedNonEmpty gate above for the same guard against the same GEE
+  // behavior) -- so gate it behind an If instead of calling it directly, or
+  // a click that misses every mapped field would surface as a hard error
+  // rather than the plain fallback item 7 asks for.
+  var matchedFeature = ee.Feature(ee.Algorithms.If(
+    fieldMatches.size().gt(0), fieldMatches.first(), ee.Feature(null)
+  ));
+
+  matchedFeature.evaluate(function(fieldInfo, error) {
+    if (myRequestId !== activeRequestId) return;
+
+    var props = (fieldInfo && fieldInfo.properties) || {};
+    var hasField = props.fid !== undefined && props.fid !== null;
+
+    if (error || !hasField) {
+      fieldContextPanel.add(ui.Label({
+        value: 'No mapped field boundary here -- showing pixel result instead.',
+        style: {fontSize: '11px', color: '#888888', margin: '0 0 4px 0'}
+      }));
+      runPixelModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId);
+      return;
+    }
+
+    var fieldGeom = matchedFeature.geometry();
+    var outlineFc = ee.FeatureCollection([matchedFeature]);
+    var outline = ee.Image().byte().paint({featureCollection: outlineFc, color: 0, width: 2});
+    replaceMapLayer(PLOT_OUTLINE_LAYER_NAME, outline, {palette: [FIELD_OUTLINE_COLOR]});
+
+    var ndviComposites = buildNdviComposites(fieldGeom, yearCfg);
+    var vhComposites = buildVhComposites(fieldGeom, yearCfg);
+
+    // Photo strip keeps its own square box around the clicked point (item 2)
+    // -- it wants surrounding context, not the field footprint.
+    buildPhotoStrip(photoRegion, yearCfg, myRequestId, lon);
+
+    renderFieldContext({
+      areaHa: props.area_ha,
+      nPx: props.n_px,
+      reliab: props.reliab,
+      batchClassId: props.class_id
+    });
+
+    inspectLive(point, fieldGeom, ndviComposites, vhComposites, yearCfg, myRequestId, ee.Reducer.mean(), fieldGeom, 1e8);
+  });
+}
+
+// Renders a Plot-mode field match's attributes into the persistent
+// fieldContextPanel slot (see buildFieldAttributeWidgets -- shared with
+// "Draw field" in the AREA ANALYSIS section below).
+function renderFieldContext(opts) {
+  fieldContextPanel.clear();
+  buildFieldAttributeWidgets(opts).forEach(function(w) { fieldContextPanel.add(w); });
 }
 
 function inspectValidated(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId) {
@@ -1409,13 +1575,23 @@ function inspectValidated(point, regionGeom, ndviComposites, vhComposites, yearC
   });
 }
 
-function inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId) {
+// extractionReducer/extractionGeom/extractionMaxPixels parameterize WHAT gets
+// reduced for the classification series: ee.Reducer.first() over the clicked
+// point at maxPixels 1e6 for the default pixel path (byte-for-byte the same
+// call this function made before Plot mode existed), or ee.Reducer.mean()
+// over a field polygon at maxPixels 1e8 for Plot mode / "Draw field" --
+// everything downstream (countCycles, the class label, addCharts) is
+// unchanged either way, just fed a different extraction. `point` itself is
+// no longer read directly here (addCharts is given extractionGeom, the
+// actual region being reduced, which equals `point` in pixel mode); kept as
+// a parameter for call-site clarity about what was clicked.
+function inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, myRequestId, extractionReducer, extractionGeom, extractionMaxPixels) {
   var extractionImage = buildNdviExtractionImage(regionGeom, yearCfg);
   var ndviDict = extractionImage.reduceRegion({
-    reducer: ee.Reducer.first(),
-    geometry: point,
+    reducer: extractionReducer,
+    geometry: extractionGeom,
     scale: SCALE_M,
-    maxPixels: 1e6
+    maxPixels: extractionMaxPixels
   });
 
   ndviDict.evaluate(function(dictResult, dictError) {
@@ -1439,7 +1615,7 @@ function inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, m
     classLabel.setValue('Class: ' + formatClassLabel(classValue, SOURCE_LIVE));
     classLabel.style().set('color', '#000000');
 
-    addCharts(ndviComposites, vhComposites, point, yearCfg, myRequestId, regionGeom);
+    addCharts(ndviComposites, vhComposites, extractionGeom, yearCfg, myRequestId, regionGeom);
   });
 }
 
@@ -1456,6 +1632,12 @@ function inspectLive(point, regionGeom, ndviComposites, vhComposites, yearCfg, m
 // field's classification against an area estimate.
 // ----------------------------------------------------------------------
 var areaRequestId = 0;
+// Which flow the in-progress/last drawingTools shape belongs to -- 'area'
+// (rectangle -> analyzeArea, sampled distribution) or 'field' (polygon ->
+// analyzeDrawnField, one field/one class). Set by drawAreaButton/
+// drawFieldButton just before Map.drawingTools().draw(); read once by the
+// single shared onDraw() callback in AREA DRAWING SETUP below.
+var drawnShapeKind = 'area';
 
 // Documented Earth Engine idiom for clearing all drawn geometries (leaves
 // the drawing-tools layer list itself intact, just empty).
@@ -1652,6 +1834,69 @@ function analyzeArea(geometry) {
       addAreaWaterUse(geometry, yearCfg, myAreaId);
       addAreaLai(geometry, yearCfg, myAreaId);
     });
+  });
+}
+
+// "Draw field" (feature 2): the drawn polygon is treated as ONE field -- mean
+// NDVI over the whole polygon -> countCycles -> a single class -- the same
+// single-field path Plot mode uses (mean reducer, field geometry, maxPixels
+// 1e8; see inspectLive's extractionReducer/extractionGeom/extractionMaxPixels
+// params), just fed a hand-drawn geometry instead of a fieldsFC match. This
+// is deliberately NOT analyzeArea() above: analyzeArea samples many points
+// across the drawn shape and reports a class distribution; this treats the
+// whole shape as one field and reports one class. It reuses analyzeArea's
+// areaRequestId stale-guard and areaPanel slot rather than inventing a
+// parallel mechanism, per the task brief.
+function analyzeDrawnField(geometry) {
+  areaRequestId++;
+  var myAreaId = areaRequestId;
+  var yearCfg = currentYearCfg;
+
+  var outlineFc = ee.FeatureCollection([ee.Feature(geometry)]);
+  var outline = ee.Image().byte().paint({featureCollection: outlineFc, color: 0, width: 2});
+  replaceMapLayer(DRAWN_FIELD_LAYER_NAME, outline, {palette: [FIELD_OUTLINE_COLOR]});
+
+  showAreaStatus('Analysing drawn field...');
+
+  var extractionImage = buildNdviExtractionImage(geometry, yearCfg);
+
+  // ONE round trip for the area (for the pixel-count reliability check, item
+  // 6) and the field-mean NDVI series -- same combined-dictionary pattern
+  // analyzeArea uses above.
+  var payload = ee.Dictionary({
+    areaHa: geometry.area(1).divide(1e4),
+    ndvi: extractionImage.reduceRegion({
+      reducer: ee.Reducer.mean(), geometry: geometry, scale: SCALE_M, maxPixels: 1e8
+    })
+  });
+
+  payload.evaluate(function(result, error) {
+    if (myAreaId !== areaRequestId) return;
+    if (error || !result) {
+      showAreaError('Error analysing drawn field: ' + (error || 'no result returned'));
+      return;
+    }
+
+    var values = [];
+    for (var i = 0; i < N_PERIODS; i++) {
+      var key = 'ndvi_' + pad2(i);
+      var v = result.ndvi ? result.ndvi[key] : null;
+      values.push(v === undefined ? null : v);
+    }
+    var cycleResult = countCycles(values, COMPOSITE_DAYS, PEAKS_CFG);
+    var classValue = cycleResult.classId === 255 ? null : cycleResult.classId;
+
+    var areaHa = typeof result.areaHa === 'number' ? result.areaHa : null;
+    // area_m2 / 100 = pixel count at the native 10 m x 10 m grid (item 6).
+    var nPx = areaHa !== null ? (areaHa * 1e4) / 100 : null;
+
+    areaPanel.clear();
+    areaPanel.add(areaPanelHeader());
+    areaPanel.add(ui.Label({
+      value: 'Class: ' + formatClassLabel(classValue, SOURCE_LIVE),
+      style: {fontWeight: 'bold', fontSize: '13px', margin: '0 0 4px 0'}
+    }));
+    buildFieldAttributeWidgets({areaHa: areaHa, nPx: nPx}).forEach(function(w) { areaPanel.add(w); });
   });
 }
 
@@ -1938,6 +2183,26 @@ var yearSelect = ui.Select({
   style: {stretch: 'horizontal'}
 });
 
+// Pixel vs Plot analysis mode (feature 1). Same re-trigger pattern as
+// photoFrameSelect above: changing it re-inspects the last clicked point
+// under the new mode so results/outline update immediately.
+var analysisModeSelect = ui.Select({
+  items: ANALYSIS_MODE_CHOICES.map(function(c) { return c.label; }),
+  value: ANALYSIS_MODE_CHOICES[0].label,
+  onChange: function(label) {
+    for (var i = 0; i < ANALYSIS_MODE_CHOICES.length; i++) {
+      if (ANALYSIS_MODE_CHOICES[i].label === label) {
+        currentAnalysisMode = ANALYSIS_MODE_CHOICES[i].mode;
+        if (lastClickedPoint) {
+          inspectPoint(lastClickedPoint.lon, lastClickedPoint.lat);
+        }
+        return;
+      }
+    }
+  },
+  style: {stretch: 'horizontal'}
+});
+
 var stateNames = STATE_CONFIGS.map(function(c) { return c.name; });
 
 var stateSelect = ui.Select({
@@ -2000,16 +2265,39 @@ var goRow = ui.Panel({
   layout: ui.Panel.Layout.Flow('horizontal')
 });
 
-// Draw-area / clear-area buttons -- see analyzeArea() and the "AREA DRAWING
-// SETUP" section below for the drawingTools wiring these trigger.
+// Draw-area / Draw-field / clear-area buttons -- see analyzeArea(),
+// analyzeDrawnField() and the "AREA DRAWING SETUP" section below for the
+// drawingTools wiring these trigger. Both draw buttons share one
+// Map.drawingTools().onDraw() callback (a GEE app has exactly one), so
+// drawnShapeKind records which flow the in-progress draw belongs to.
 var drawAreaButton = ui.Button({
   label: 'Draw area',
   onClick: function() {
-    areaRequestId++; // invalidate any in-flight analyzeArea from a previous draw
+    areaRequestId++; // invalidate any in-flight analyzeArea/analyzeDrawnField from a previous draw
     clearDrawnGeometries();
     removeLayerByName(AREA_LAYER_NAME);
+    removeLayerByName(DRAWN_FIELD_LAYER_NAME);
+    drawnShapeKind = 'area';
     showAreaStatus('Draw a rectangle on the map, then release to analyse it.');
     Map.drawingTools().setShape('rectangle');
+    Map.drawingTools().setShown(true);
+    Map.drawingTools().draw();
+  }
+});
+
+// "Draw field" (feature 2): traces an irregular parcel as a polygon rather
+// than a rectangle, and treats the WHOLE shape as one field (analyzeDrawnField)
+// instead of analyzeArea's many-sampled-points distribution.
+var drawFieldButton = ui.Button({
+  label: 'Draw field',
+  onClick: function() {
+    areaRequestId++; // invalidate any in-flight analyzeArea/analyzeDrawnField from a previous draw
+    clearDrawnGeometries();
+    removeLayerByName(AREA_LAYER_NAME);
+    removeLayerByName(DRAWN_FIELD_LAYER_NAME);
+    drawnShapeKind = 'field';
+    showAreaStatus('Draw a polygon around one field, then close the shape to analyse it.');
+    Map.drawingTools().setShape('polygon');
     Map.drawingTools().setShown(true);
     Map.drawingTools().draw();
   }
@@ -2018,16 +2306,17 @@ var drawAreaButton = ui.Button({
 var clearAreaButton = ui.Button({
   label: 'Clear area',
   onClick: function() {
-    areaRequestId++; // invalidate any in-flight analyzeArea callback
+    areaRequestId++; // invalidate any in-flight analyzeArea/analyzeDrawnField callback
     clearDrawnGeometries();
     removeLayerByName(AREA_LAYER_NAME);
+    removeLayerByName(DRAWN_FIELD_LAYER_NAME);
     Map.drawingTools().setShape(null);
     clearAreaResults();
   }
 });
 
 var areaButtonRow = ui.Panel({
-  widgets: [drawAreaButton, clearAreaButton],
+  widgets: [drawAreaButton, drawFieldButton, clearAreaButton],
   layout: ui.Panel.Layout.Flow('horizontal')
 });
 
@@ -2062,6 +2351,8 @@ var controlPanel = ui.Panel({
     ui.Label({value: 'Karnataka Cropping Inspector', style: {fontWeight: 'bold', fontSize: '15px', margin: '4px 4px 8px 4px'}}),
     ui.Label({value: 'Agricultural year', style: {margin: '0 4px 2px 4px'}}),
     yearSelect,
+    ui.Label({value: 'Analysis mode', style: {margin: '8px 4px 2px 4px'}}),
+    analysisModeSelect,
     ui.Label({value: 'Photo frame width', style: {margin: '8px 4px 2px 4px'}}),
     photoFrameSelect,
     ui.Label({value: 'State', style: {margin: '8px 4px 2px 4px'}}),
@@ -2144,8 +2435,12 @@ var fieldInsetCaption = ui.Label({
 });
 var photoStripPanel = ui.Panel({layout: ui.Panel.Layout.Flow('vertical'), style: {margin: '0 8px 8px 8px'}});
 var chartsPanel = ui.Panel({layout: ui.Panel.Layout.Flow('vertical'), style: {margin: '0 8px'}});
+// Plot-mode field attributes (area/pixel-count/reliability/batch class, or a
+// plain fallback explanation) -- see renderFieldContext() and
+// buildFieldAttributeWidgets(). Empty and invisible in pixel mode.
+var fieldContextPanel = ui.Panel({layout: ui.Panel.Layout.Flow('vertical'), style: {margin: '0 8px 4px 8px'}});
 var resultsPanel = ui.Panel({
-  widgets: [locationLabel, classLabel, fieldInsetMap, fieldInsetCaption, photoStripPanel, chartsPanel],
+  widgets: [locationLabel, classLabel, fieldContextPanel, fieldInsetMap, fieldInsetCaption, photoStripPanel, chartsPanel],
   layout: ui.Panel.Layout.Flow('vertical'),
   style: {margin: '4px 0'}
 });
@@ -2187,7 +2482,11 @@ ui.root.insert(1, sidePanel);
 Map.drawingTools().setLinked(false);
 Map.drawingTools().onDraw(function(geometry) {
   Map.drawingTools().setShape(null);
-  analyzeArea(geometry);
+  if (drawnShapeKind === 'field') {
+    analyzeDrawnField(geometry);
+  } else {
+    analyzeArea(geometry);
+  }
 });
 
 // ----------------------------------------------------------------------
