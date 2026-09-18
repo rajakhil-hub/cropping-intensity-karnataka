@@ -1454,8 +1454,32 @@ function inspectPoint(lon, lat) {
     if (currentAnalysisMode === 'plot') {
       runPlotModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId);
     } else {
+      highlightFieldAt(point, myRequestId);
       runPixelModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId);
     }
+  });
+}
+
+// Outline whichever mapped field contains the clicked point, independently of
+// analysis mode. Plot mode draws this itself as part of its own lookup, so
+// this is called only on the pixel path -- but it matters there: seeing the
+// parcel you clicked is useful even when the number shown is the pixel's, and
+// requiring a mode switch just to see a boundary was the wrong default.
+// Silent by design: a click outside the mapped distributary simply leaves no
+// outline, since the fallback message already explains the situation.
+function highlightFieldAt(point, myRequestId) {
+  if (!fieldsAssetAvailable) return;
+  var matches = fieldsFC.filterBounds(point);
+  var matched = ee.Feature(ee.Algorithms.If(
+    matches.size().gt(0), matches.first(), ee.Feature(null)
+  ));
+  matched.evaluate(function(info, error) {
+    if (myRequestId !== activeRequestId) return;
+    var props = (info && info.properties) || {};
+    if (error || props.fid === undefined || props.fid === null) return;
+    var outlineFc = ee.FeatureCollection([matched]);
+    var outline = ee.Image().byte().paint({featureCollection: outlineFc, color: 0, width: 2});
+    replaceMapLayer(PLOT_OUTLINE_LAYER_NAME, outline, {palette: [FIELD_OUTLINE_COLOR]});
   });
 }
 
@@ -2324,7 +2348,11 @@ var areaButtonRow = ui.Panel({
 // asset probe after startup (see below Map.add(controlPanel)).
 var fieldsCheckbox = ui.Checkbox({
   label: 'Show field boundaries',
-  value: false,
+  // Checked by default: the asset exists to be seen, and leaving the overlay
+  // off meant the boundaries appeared to be missing entirely. The probe below
+  // only enables the control once the asset resolves, so a checked-but-absent
+  // asset still cannot produce a layer error.
+  value: true,
   disabled: true,
   onChange: function(checked) {
     if (fieldsFillLayer) fieldsFillLayer.setShown(checked);
@@ -2384,10 +2412,12 @@ fieldsFC.size().evaluate(function(count, error) {
     return;
   }
   fieldsAssetAvailable = true;
+  // Shown immediately (matching fieldsCheckbox's checked default) so the
+  // boundaries are visible the moment the asset is available.
   fieldsFillLayer = Map.addLayer(
-    fieldsFill, {min: 0, max: 4, palette: PALETTE}, FIELDS_FILL_LAYER_NAME, false, FIELDS_FILL_OPACITY);
+    fieldsFill, {min: 0, max: 4, palette: PALETTE}, FIELDS_FILL_LAYER_NAME, true, FIELDS_FILL_OPACITY);
   fieldsEdgeLayer = Map.addLayer(
-    fieldsEdge, {palette: ['000000']}, FIELDS_EDGE_LAYER_NAME, false);
+    fieldsEdge, {palette: ['000000']}, FIELDS_EDGE_LAYER_NAME, true);
   fieldsCheckbox.setDisabled(false);
   fieldsZoomButton.setDisabled(false);
   fieldsNote.setValue(count + ' fields - colours are the FIELD-scale class, which can differ from the pixel class.');
