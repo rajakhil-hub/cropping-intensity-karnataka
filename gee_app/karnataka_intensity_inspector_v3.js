@@ -96,10 +96,11 @@ var YEAR_CONFIGS = [
 var currentYearCfg = YEAR_CONFIGS[0];
 var lastClickedPoint = null; // {lon, lat}
 // Pixel vs Plot analysis mode -- see ANALYSIS_MODE_CHOICES / analysisModeSelect
-// below and inspectPoint()'s mode branch. 'pixel' is the original, unchanged
-// per-10m-pixel behavior; 'plot' reduces mean() over the matched field
-// boundary (FIELDS_ASSET_ID) instead of the clicked pixel.
-var currentAnalysisMode = 'pixel';
+// below and inspectPoint()'s mode branch. 'plot' is the default (reduces
+// mean() over the matched field boundary, FIELDS_ASSET_ID, instead of the
+// clicked pixel); 'pixel' remains selectable from the dropdown and is the
+// original, unchanged per-10m-pixel behavior.
+var currentAnalysisMode = 'plot';
 var INTENSITY_LAYER_NAME = 'Cropping Intensity 2024-25 (Raichur, validated)';
 // Photo-strip rendering params (display only -- the NDVI/VH extraction path
 // never touches these). Measured cause of the original blockiness: S2 is
@@ -132,11 +133,13 @@ var PHOTO_FRAME_CHOICES = [
   {label: 'Wide (1 km)', halfSide: 500}
 ];
 // Pixel vs Plot analysis mode choices for analysisModeSelect (see CONTROL
-// PANEL below). 'plot' routes inspectPoint() through the matched-field path
-// (runPlotModeInspection) instead of the default per-pixel path.
+// PANEL below). Plot is listed first so it is the default -- analysisModeSelect
+// below reads ANALYSIS_MODE_CHOICES[0].label as its initial value. 'plot'
+// routes inspectPoint() through the matched-field path (runPlotModeInspection);
+// 'pixel' falls back to the original per-pixel path.
 var ANALYSIS_MODE_CHOICES = [
-  {label: 'Pixel (10 m)', mode: 'pixel'},
-  {label: 'Plot / field boundary', mode: 'plot'}
+  {label: 'Plot / field boundary', mode: 'plot'},
+  {label: 'Pixel (10 m)', mode: 'pixel'}
 ];
 // On-screen size of one monthly frame. This is the setting that actually
 // governs how sharp the strip looks, and getting it wrong was the real bug:
@@ -188,6 +191,15 @@ var CLOUDSCORE_COLLECTION_ID = 'GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED';
 var CLOUDSCORE_BAND = 'cs_cdf';
 var S1_COLLECTION_ID = 'COPERNICUS/S1_GRD';
 var S1_BAND = 'VH';
+var S1_VV_BAND = 'VV';
+// RVI needs a fixed viewing geometry: VV and VH backscatter both depend on
+// incidence angle, and ascending vs descending passes image the same ground
+// at different angles, so mixing passes would blend two different
+// measurement geometries into one "time series" and corrupt the ratio.
+// We filter to one pass to keep incidence angle consistent; if a different
+// pass turns out to have denser coverage over Raichur, this is the one
+// place to flip it.
+var S1_ORBIT_PASS = 'DESCENDING';
 var SCALE_M = 10;
 
 // Classified asset (uint8). May still be ingesting at time of writing --
@@ -303,6 +315,17 @@ var ET_UNIT_SCALE = 0.1;        // MOD16A2 ET/PET are stored as 0.1 mm
 // magnitude, over paddy. See src/cropint/gee/biophysical.py for the algorithm.
 var LAI_CHART_HEIGHT = 160; // secondary chart, same height as the VH chart
 var LAI_PADDY_CAVEAT_NOTE = 'Rice/paddy is not in SL2P\'s training crop list -- trust the curve shape, not its absolute magnitude, over paddy.';
+
+var RVI_CHART_HEIGHT = 160; // -- same height as the VH/LAI charts
+// DpRVIc (the dual-pol compact-pol RVI variant) was evaluated and
+// deliberately left out: Sentinel-1 GRD is intensity-only (no phase), which
+// zeroes the cross-correlation term DpRVIc's eigenvalue decomposition needs,
+// collapsing it to a strictly monotonic function of VH/VV -- the same
+// information plain RVI already carries (measured rank correlation 1.000,
+// Pearson 0.991 between the two). True DpRVIc needs SLC data, which this
+// project does not ingest.
+var RVI_DPRVIC_NOTE = 'DpRVIc was evaluated and left out: GRD has no phase, so it collapses to a ' +
+  'monotonic function of VH/VV (rank corr. 1.000, Pearson 0.991 vs. RVI) -- true DpRVIc needs SLC data.';
 
 // State configs: one entry per state this app supports. Only Karnataka is
 // wired up today; add more entries here (each with its own GAUL ADM1 name
@@ -863,12 +886,46 @@ function buildVhCollection(regionGeom, yearCfg) {
     .select(S1_BAND);
 }
 
+// RVI = 4 * VH / (VV + VH), computed on linear power -- S1_GRD stores VV/VH
+// in dB (log-compressed), and a ratio of logs is not the ratio of powers RVI
+// is defined over, so converting dB -> linear before the ratio is mandatory,
+// not a style choice.
+//
+// Deliberately NO boxcar/focal speckle filter here. A 5x5 boxcar at 10 m is a
+// 2,500 sq m window -- 3.3x the median field size in this study area (764 sq m
+// per scripts/classify_fields.py) -- so it would blend 3+ neighbouring fields
+// together. In Plot mode the field polygon's own ee.Reducer.mean() IS the
+// correct spatial averaging for speckle here; an extra filter would just
+// double-average, and it would still be wrong for Pixel mode, where no
+// averaging should happen at all. Do not add one back in.
+function buildRviCollection(regionGeom, yearCfg) {
+  return ee.ImageCollection(S1_COLLECTION_ID)
+    .filterDate(yearCfg.agriStart, yearCfg.agriEnd)
+    .filterBounds(regionGeom)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq('orbitProperties_pass', S1_ORBIT_PASS))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', S1_VV_BAND))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', S1_BAND))
+    .select([S1_VV_BAND, S1_BAND])
+    .map(function(img) {
+      var linear = ee.Image(10).pow(img.divide(10)); // dB -> linear power, both bands at once
+      var vv = linear.select(S1_VV_BAND);
+      var vh = linear.select(S1_BAND);
+      var rvi = vh.multiply(4).divide(vv.add(vh)).rename('RVI');
+      return ee.Image(rvi.copyProperties(img, ['system:time_start']));
+    });
+}
+
 function buildNdviComposites(regionGeom, yearCfg) {
   return makePeriodicComposites(buildNdviCollection(regionGeom, yearCfg), yearCfg.agriStart, N_PERIODS, COMPOSITE_DAYS);
 }
 
 function buildVhComposites(regionGeom, yearCfg) {
   return makePeriodicComposites(buildVhCollection(regionGeom, yearCfg), yearCfg.agriStart, N_PERIODS, COMPOSITE_DAYS);
+}
+
+function buildRviComposites(regionGeom, yearCfg) {
+  return makePeriodicComposites(buildRviCollection(regionGeom, yearCfg), yearCfg.agriStart, N_PERIODS, COMPOSITE_DAYS);
 }
 
 // SL2P runs per-scene on buildS2MaskedCollection's output BEFORE compositing:
@@ -1210,6 +1267,33 @@ function addCharts(ndviComposites, vhComposites, point, yearCfg, myRequestId, re
     height: LAI_CHART_HEIGHT
   });
   chartsPanel.add(laiChart);
+
+  // Same stale-guard, same reasoning, as the one above LAI: build and add
+  // last so the cheaper charts above are never held up waiting on this one.
+  if (myRequestId !== activeRequestId) return;
+
+  var rviComposites = buildRviComposites(regionGeom, yearCfg);
+  var rviChart = ui.Chart.image.series({
+    imageCollection: rviComposites,
+    region: point,
+    reducer: ee.Reducer.mean(),
+    scale: SCALE_M,
+    xProperty: 'system:time_start'
+  }).setOptions({
+    title: 'Sentinel-1 RVI ' + yearRange + ' -- cloud-penetrating radar veg. index, ' +
+      'fills the Jun-Sep monsoon gap where optical NDVI thins out from cloud masking. ' +
+      'Theoretical range 0-4; cropland typically sits well below 1.',
+    vAxis: {title: 'RVI'},
+    hAxis: {title: 'Date'},
+    lineWidth: 2,
+    pointSize: 2,
+    height: RVI_CHART_HEIGHT
+  });
+  chartsPanel.add(rviChart);
+  chartsPanel.add(ui.Label({
+    value: RVI_DPRVIC_NOTE,
+    style: {fontSize: '10px', color: '#666666', margin: '2px 0 0 0'}
+  }));
 }
 
 // Builds the 12-monthly photo strip for the currently inspected point.
@@ -1490,10 +1574,11 @@ function highlightFieldAt(point, myRequestId) {
   });
 }
 
-// Default per-10m-pixel path -- unchanged in outcome from before Analysis
-// mode existed: same reducer (first()), same geometry (the clicked point),
-// same maxPixels (1e6). Also the fallback target when Plot mode can't find a
-// field (no boundary asset loaded, or the click misses every mapped field).
+// Per-10m-pixel path -- unchanged in outcome from before Analysis mode
+// existed: same reducer (first()), same geometry (the clicked point), same
+// maxPixels (1e6). Still selectable via the mode dropdown (analysisModeSelect),
+// and also the fallback target when Plot mode can't find a field (no boundary
+// asset loaded, or the click misses every mapped field).
 function runPixelModeInspection(point, lon, lat, photoRegion, flags, yearCfg, myRequestId) {
   var regionGeom = point.buffer(BUFFER_RADIUS_M);
   var ndviComposites = buildNdviComposites(regionGeom, yearCfg);
@@ -1608,7 +1693,7 @@ function inspectValidated(point, regionGeom, ndviComposites, vhComposites, yearC
 
 // extractionReducer/extractionGeom/extractionMaxPixels parameterize WHAT gets
 // reduced for the classification series: ee.Reducer.first() over the clicked
-// point at maxPixels 1e6 for the default pixel path (byte-for-byte the same
+// point at maxPixels 1e6 for the pixel path (byte-for-byte the same
 // call this function made before Plot mode existed), or ee.Reducer.mean()
 // over a field polygon at maxPixels 1e8 for Plot mode / "Draw field" --
 // everything downstream (countCycles, the class label, addCharts) is
