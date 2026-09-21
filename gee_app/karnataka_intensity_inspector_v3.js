@@ -1160,9 +1160,9 @@ var classifiedRaw = ee.Image(CLASSIFIED_ASSET_ID);
 var classifiedImage = classifiedRaw.updateMask(classifiedRaw.neq(255));
 
 // The validated-map asset may not have been uploaded yet. Probed async at
-// startup (see MAP SETUP); until confirmed, every click uses the live path
-// and the legend explains why. Uploading the asset later auto-upgrades the
-// app on its next load -- no code change needed.
+// startup (see MAP SETUP); until confirmed, every click uses the live path,
+// which the results panel labels as such. Uploading the asset later
+// auto-upgrades the app on its next load -- no code change needed.
 var validatedAssetAvailable = false;
 
 // paint() rasterises the parcel polygons: the fill carries class_id so it
@@ -2189,8 +2189,8 @@ Map.onChangeBounds(applyFieldsZoomVisibility);
 
 // Add the validated-map layer only if the asset actually exists: an eager
 // addLayer on a missing asset surfaces a permanent layer error. The probe
-// resolves after startup, so it also refreshes the legend note and applies
-// the current year's visibility itself.
+// resolves after startup, so it applies the current year's visibility
+// itself.
 classifiedImage.bandNames().evaluate(function(bandNames, error) {
   if (!error && bandNames && bandNames.length) {
     validatedAssetAvailable = true;
@@ -2203,72 +2203,13 @@ classifiedImage.bandNames().evaluate(function(bandNames, error) {
     );
     applyIntensityZoomVisibility();
   }
-  updateLegendForYear(currentYearCfg);
 });
-
-// ----------------------------------------------------------------------
-// LEGEND (bottom-left panel) -- verbatim from v1.
-// ----------------------------------------------------------------------
-function makeLegendRow(color, label) {
-  var colorBox = ui.Label({
-    style: {
-      backgroundColor: color,
-      padding: '8px',
-      margin: '0 0 4px 0'
-    }
-  });
-  var description = ui.Label({
-    value: label,
-    style: {margin: '0 0 4px 6px'}
-  });
-  return ui.Panel({
-    widgets: [colorBox, description],
-    layout: ui.Panel.Layout.Flow('horizontal')
-  });
-}
-
-var legend = ui.Panel({
-  style: {
-    position: 'bottom-left',
-    padding: '8px 15px'
-  }
-});
-legend.add(ui.Label({
-  value: 'Cropping Intensity (2024-25)',
-  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 6px 0'}
-}));
-CLASS_INFO.forEach(function(c) {
-  legend.add(makeLegendRow(c.color, c.value + ' — ' + c.label));
-});
-legend.add(ui.Label({
-  value: 'Transparent / no color = nodata (255, masked)',
-  style: {fontSize: '11px', color: '#666666', margin: '6px 0 0 0'}
-}));
-var legendYearNote = ui.Label('', {fontSize: '11px', color: '#cc0000', margin: '6px 0 0 0'});
-legend.add(legendYearNote);
-Map.add(legend);
-
-function updateLegendForYear(yearCfg) {
-  if (!validatedAssetAvailable) {
-    legendYearNote.setValue(
-      'Validated 2024-25 map not uploaded yet -- all results are computed ' +
-      'live (same algorithm). Upload asset raichur_intensity_2024_25 to enable it.'
-    );
-  } else if (yearCfg.validatedAssetEligible) {
-    legendYearNote.setValue('');
-  } else {
-    legendYearNote.setValue(
-      'Validated 2024-25 map hidden for ' + yearCfg.label +
-      ' -- this year uses the live classification path everywhere, including Raichur.'
-    );
-  }
-}
 
 // ----------------------------------------------------------------------
 // YEAR SELECTION
 // Applying a year swaps currentYearCfg, toggles the validated intensity
-// layer's visibility, updates the legend note, and -- if a point has
-// already been inspected -- re-runs that inspection under the new year.
+// layer's visibility, and -- if a point has already been inspected --
+// re-runs that inspection under the new year.
 // ----------------------------------------------------------------------
 function applyYearSelection(yearCfg) {
   currentYearCfg = yearCfg;
@@ -2276,7 +2217,6 @@ function applyYearSelection(yearCfg) {
   // zoomed out far enough for a solid fill to be useful" -- both rules live in
   // applyIntensityZoomVisibility so they cannot disagree.
   applyIntensityZoomVisibility();
-  updateLegendForYear(yearCfg);
   if (lastClickedPoint) {
     inspectPoint(lastClickedPoint.lon, lastClickedPoint.lat);
   }
