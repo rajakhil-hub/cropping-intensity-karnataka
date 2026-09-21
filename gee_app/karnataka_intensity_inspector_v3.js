@@ -2097,6 +2097,10 @@ Map.onChangeZoom(function() {
   applyIntensityZoomVisibility();
   applyFieldsZoomVisibility();
 });
+// Belt and braces: onChangeBounds fires for pans and for programmatic
+// setCenter() moves that onChangeZoom alone can miss, so the overlay can
+// never be left hidden while the viewer is sitting above the zoom floor.
+Map.onChangeBounds(applyFieldsZoomVisibility);
 
 // Add the validated-map layer only if the asset actually exists: an eager
 // addLayer on a missing asset surfaces a permanent layer error. The probe
@@ -2391,6 +2395,11 @@ var fieldsZoomButton = ui.Button({
   onClick: function() {
     Map.setCenter(FIELDS_CENTER.lon, FIELDS_CENTER.lat, FIELDS_CENTER.zoom);
     if (!fieldsCheckbox.getValue()) fieldsCheckbox.setValue(true); // fires onChange
+    // ...but setValue() only fires onChange when the value actually CHANGES,
+    // and the box is checked by default -- so the line above is usually a
+    // no-op and cannot be relied on to reveal the layers. Re-evaluate
+    // directly rather than depending on setCenter's onChangeZoom arriving.
+    applyFieldsZoomVisibility();
   }
 });
 
