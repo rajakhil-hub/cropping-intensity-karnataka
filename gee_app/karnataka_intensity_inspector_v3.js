@@ -276,6 +276,13 @@ var FIELD_INSET_ZOOM = 17;
 // if the user re-enables it manually).
 var INTENSITY_LAYER_OPACITY = 0.55;
 var INTENSITY_HIDE_ZOOM = 14;
+// Below this zoom the field overlay is not drawn at all. 14,457 polygons is
+// nothing at parcel zoom, but at state zoom a single tile has to rasterise
+// every one of them, which is what produced "Earth Engine memory capacity
+// exceeded". The parcels are sub-pixel on screen down there anyway, so there
+// is nothing lost by hiding them -- and the distributary is only 3.8 x 6.7 km,
+// so zoom 13 still frames the whole block.
+var FIELDS_MIN_ZOOM = 13;
 var AREA_LAYER_NAME = 'drawn area';
 
 // Water use (MODIS MOD16A2GF, 463 m, 8-day, gap-filled). Deliberately area-only:
@@ -2064,13 +2071,32 @@ Map.setOptions('HYBRID');
 // Hide the solid classification fill once zoomed in to field level, so the
 // imagery underneath is actually visible; show it again when zoomed back out
 // to the area scale where it is the point of the map.
+// Mirrors applyIntensityZoomVisibility, but gating on a zoom FLOOR rather
+// than a ceiling: the intensity raster is hidden when you zoom in, the field
+// vectors are hidden when you zoom out.
+function applyFieldsZoomVisibility() {
+  if (!fieldsAssetAvailable) return;
+  var shown = fieldsCheckbox.getValue() && Map.getZoom() >= FIELDS_MIN_ZOOM;
+  if (fieldsFillLayer) fieldsFillLayer.setShown(shown);
+  if (fieldsEdgeLayer) fieldsEdgeLayer.setShown(shown);
+  if (fieldsCheckbox.getValue() && !shown) {
+    fieldsNote.setValue('Zoom in to level ' + FIELDS_MIN_ZOOM +
+      ' or closer to draw field boundaries (too many parcels to render zoomed out).');
+  } else if (shown) {
+    fieldsNote.setValue(fieldsLoadedNote);
+  }
+}
+
 function applyIntensityZoomVisibility() {
   if (!validatedAssetAvailable) return;
   var zoom = Map.getZoom();
   var showByYear = currentYearCfg.validatedAssetEligible;
   setLayerShownByName(INTENSITY_LAYER_NAME, showByYear && zoom < INTENSITY_HIDE_ZOOM);
 }
-Map.onChangeZoom(applyIntensityZoomVisibility);
+Map.onChangeZoom(function() {
+  applyIntensityZoomVisibility();
+  applyFieldsZoomVisibility();
+});
 
 // Add the validated-map layer only if the asset actually exists: an eager
 // addLayer on a missing asset surfaces a permanent layer error. The probe
@@ -2354,9 +2380,8 @@ var fieldsCheckbox = ui.Checkbox({
   // asset still cannot produce a layer error.
   value: true,
   disabled: true,
-  onChange: function(checked) {
-    if (fieldsFillLayer) fieldsFillLayer.setShown(checked);
-    if (fieldsEdgeLayer) fieldsEdgeLayer.setShown(checked);
+  onChange: function() {
+    applyFieldsZoomVisibility(); // honours the zoom floor as well as the box
   }
 });
 
@@ -2369,6 +2394,7 @@ var fieldsZoomButton = ui.Button({
   }
 });
 
+var fieldsLoadedNote = '';
 var fieldsNote = ui.Label({
   value: 'Checking for field asset...',
   style: {fontSize: '10px', color: '#888888', margin: '0 4px 2px 4px'}
@@ -2414,13 +2440,16 @@ fieldsFC.size().evaluate(function(count, error) {
   fieldsAssetAvailable = true;
   // Shown immediately (matching fieldsCheckbox's checked default) so the
   // boundaries are visible the moment the asset is available.
+  // Added hidden; applyFieldsZoomVisibility() below decides whether the
+  // current zoom is close enough to render them.
   fieldsFillLayer = Map.addLayer(
-    fieldsFill, {min: 0, max: 4, palette: PALETTE}, FIELDS_FILL_LAYER_NAME, true, FIELDS_FILL_OPACITY);
+    fieldsFill, {min: 0, max: 4, palette: PALETTE}, FIELDS_FILL_LAYER_NAME, false, FIELDS_FILL_OPACITY);
   fieldsEdgeLayer = Map.addLayer(
-    fieldsEdge, {palette: ['000000']}, FIELDS_EDGE_LAYER_NAME, true);
+    fieldsEdge, {palette: ['000000']}, FIELDS_EDGE_LAYER_NAME, false);
   fieldsCheckbox.setDisabled(false);
   fieldsZoomButton.setDisabled(false);
-  fieldsNote.setValue(count + ' fields - colours are the FIELD-scale class, which can differ from the pixel class.');
+  fieldsLoadedNote = count + ' fields - colours are the FIELD-scale class, which can differ from the pixel class.';
+  applyFieldsZoomVisibility(); // sets both the layer visibility and the note
 });
 
 // ----------------------------------------------------------------------
